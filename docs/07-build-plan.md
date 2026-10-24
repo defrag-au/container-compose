@@ -16,7 +16,12 @@ empty or back to `default` when it finished.
 Each one is marked **forced** (the runtime behaves this way) or **decision** (a
 choice still to be made).
 
-### D1 — `restart = "on-failure"` cannot be honoured (decision)
+### D1 — `restart` is `no`, `on-stop` or `always` (decided)
+
+The design's `on-failure` is replaced by **`on-stop`**: restart whenever the
+service is not running, capped by `max_retries`. The name is honest about what
+the tool can test. `always` is the same with no cap; `no` never restarts. The
+reasoning, and why `--attach` does not rescue an exit-code test, is below.
 
 The runtime records two container states and **no exit code**. `list --all
 --format json` reports `status.state` as `running` or `stopped`, plus
@@ -27,26 +32,16 @@ is indistinguishable from one stopped by `container stop`.
 There is one other channel: `container start --attach` propagates the
 container's exit code to the process that started it (measured: `exit 7` → 7,
 `exit 0` → 0, a container stopped by `container stop` → 137). It does not rescue
-`on-failure`, for the reasons below, but it is the only way the code is ever
-visible.
-
-Three options:
-
-1. **Rename the policy to `on-stop`** — restart whenever the service is not
-   running, capped by `max_retries`; `always` is the same with no cap. Honest
-   name, small schema change. **Recommended.**
-2. Keep the name `on-failure` and define it as "any stop". No schema churn, but
-   the name then lies about the trigger.
-3. Drop `on-failure` and keep `no`/`always` only. Loses the bounded-retry
-   policy, which is the useful half.
+an exit-code policy, for the reasons below, but it is the only way the code is
+ever visible.
 
 #### Why `--attach` does not rescue `on-failure`
 
 The exit code is only available to the process that starts the container.
 
 - A container already running when `up` starts (adoption) cannot be attached, so
-  its exit is unattributable until the supervisor restarts it. `on-failure`
-  would silently degrade to `on-stop` for adopted services.
+  its exit is unattributable until the supervisor restarts it. An exit-code
+  policy would silently degrade to `on-stop` for adopted services.
 - An attached start without a TTY emitted roughly 16 KB of
   `failed to send signal: ["signal": 28, …]` in six seconds before the stop,
   which pollutes any stream the supervisor shares with the container.
@@ -56,7 +51,7 @@ The exit code is only available to the process that starts the container.
 Intent tracking covers the tool's own stops; nothing covers anyone else's. The
 supervisor therefore polls and does not use `--attach`.
 
-Whichever option is chosen, the discrimination rule is: **the tool knows the
+Whichever policy is chosen, the discrimination rule is: **the tool knows the
 stops it issued, and nothing else.** The supervisor sets an intent for a service
 immediately before it stops it (Ctrl-C, failure cleanup, recreate) and clears it
 on the next successful start. A `running → stopped` transition with no intent is
@@ -441,12 +436,10 @@ drift reporting, `ps --probe`, the real-runtime smoke test.
 
 ## Open questions
 
-1. **D1 naming** — `on-stop`, keep `on-failure` with a different definition, or
-   drop it?
-2. **The mitos spool** — one container running both processes, or a host bind
+1. **The mitos spool** — one container running both processes, or a host bind
    mount? Bind-mount sharing across containers needs one probe before the
    fixture is rewritten.
-3. **Single-label aliases** without a configured DNS domain: warn in `plan` (as
+2. **Single-label aliases** without a configured DNS domain: warn in `plan` (as
    `01-model.md` says) or refuse at load, since they will fail at create?
-4. Fold the deltas back into `01`–`05`, or keep `07` as the superseding
+3. Fold the deltas back into `01`–`05`, or keep `07` as the superseding
    document?
