@@ -1,13 +1,14 @@
 # container-compose — design
 
-Status: **design pass, 2026-10-24.** Nothing built. These documents are the brief
-for the initial implementation; none of them describes running code.
+Status: **built, 2026-10-24.** `01`–`05` are the contract the code is held to.
+`07` is what happened when the runtime was measured: the design changes it forced,
+the build order, and the probes taken after the first build. Where a document here
+and `07` disagree, `07` is the one that was measured.
 
 Seven documents, written to be read in order and then used as a checklist. The
 test of the design is not that it is complete — it is that the build session can
-tell, from the document, what to do when the runtime disagrees with it. The last
-document is that session's record: measured runtime behaviour, the design changes
-it forced, and the build order.
+tell, from the document, what to do when the runtime disagrees with it. That
+record is the last document.
 
 A small orchestration layer over Apple's
 [`container`](https://github.com/apple/container), which runs Linux containers as
@@ -38,22 +39,22 @@ supervisor; it is not a runtime, not a daemon and not a Compose clone.
 | [`06-roadmap.md`](06-roadmap.md) | milestones, the first consumer, open questions |
 | [`07-build-plan.md`](07-build-plan.md) | measured runtime behaviour, the design deltas it forces, and the build order |
 
-## The three decisions this design needs
+## The three decisions, and where they landed
 
-1. **Own TOML, or Compose-file compatibility?** This document assumes own TOML
-   (`stack.toml`). A Compose file would promise restart policies, healthchecks,
-   `depends_on` conditions and DNS that the runtime does not provide; translating
-   it would mean silently ignoring half of it. See
+1. **Own TOML, or Compose-file compatibility?** Own TOML, built. A Compose file
+   would promise restart policies, healthchecks, `depends_on` conditions and DNS
+   that the runtime does not provide; the features that cannot be honoured are
+   refused instead. See
    [`02-stack-file.md`](02-stack-file.md#why-not-compose-yaml).
-2. **Foreground supervisor, or launchd?** `container` has no restart policy, so a
-   detached stack cannot heal. The design makes supervision a foreground
-   property and refuses detached stacks that ask for restarts. See
+2. **Foreground supervisor, or launchd?** Foreground, built. `container` has no
+   restart policy, so a detached stack cannot heal: `up -d` refuses any service
+   that asks to restart. launchd supervision remains on the
+   [roadmap](06-roadmap.md) and is not built. See
    [`01-model.md`](01-model.md#the-supervisor-decision).
-3. **Shared writable volumes across containers.** The runtime documents named
-   volumes but not concurrent attachment. The design does not rely on it: one
-   writer per volume, or a host bind mount, or one container running both
-   processes. Verify before changing that. See
-   [`04-runtime.md`](04-runtime.md#volumes).
+3. **Shared writable volumes across containers.** Settled by measurement: a host
+   bind mount is shareable across running containers, with `:ro` enforced (see
+   [`07-build-plan.md`](07-build-plan.md)). Named volumes stay one writer per
+   volume. See [`04-runtime.md`](04-runtime.md#volumes).
 
 ## Naming
 
