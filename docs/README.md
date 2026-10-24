@@ -3,9 +3,11 @@
 Status: **design pass, 2026-10-24.** Nothing built. These documents are the brief
 for the initial implementation; none of them describes running code.
 
-Six documents, written to be read in order and then used as a checklist. The
+Seven documents, written to be read in order and then used as a checklist. The
 test of the design is not that it is complete — it is that the build session can
-tell, from the document, what to do when the runtime disagrees with it.
+tell, from the document, what to do when the runtime disagrees with it. The last
+document is that session's record: measured runtime behaviour, the design changes
+it forced, and the build order.
 
 A small orchestration layer over Apple's
 [`container`](https://github.com/apple/container), which runs Linux containers as
@@ -34,6 +36,7 @@ supervisor; it is not a runtime, not a daemon and not a Compose clone.
 | [`04-runtime.md`](04-runtime.md) | what Apple `container` does and does not provide, and the mapping |
 | [`05-testing.md`](05-testing.md) | the fake runtime, golden plans, and what needs the real thing |
 | [`06-roadmap.md`](06-roadmap.md) | milestones, the first consumer, open questions |
+| [`07-build-plan.md`](07-build-plan.md) | measured runtime behaviour, the design deltas it forces, and the build order |
 
 ## The three decisions this design needs
 

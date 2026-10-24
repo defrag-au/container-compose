@@ -11,5 +11,6 @@ restart policy.
 
 **Status: design, 2026-10-24. Nothing is built yet.**
 
-Start at [`docs/README.md`](docs/README.md); the implementation brief is
-[`docs/06-roadmap.md`](docs/06-roadmap.md).
+Start at [`docs/README.md`](docs/README.md); the design is [`docs/01-model.md`](docs/01-model.md)
+through [`docs/05-testing.md`](docs/05-testing.md), and the build plan — including
+what the runtime actually does — is [`docs/07-build-plan.md`](docs/07-build-plan.md).
