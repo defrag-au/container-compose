@@ -1,0 +1,12 @@
+# Captured 2026-10-24T04:25:55Z by scripts/capture-runtime-fixtures.sh
+# Project name: ccfixtures-31236 (deleted at the end of the run)
+#
+# container system status --format json  -> system-status.json
+# container system version --format json -> system-version.json
+# container list --all --format json     -> container-list.json
+# container inspect ccfixtures-31236-api ccfixtures-31236-worker -> container-inspect.json
+# container volume list --format json    -> volume-list.json
+# container volume inspect ccfixtures-31236-vol -> volume-inspect.json
+# container network list --format json   -> network-list.json
+# container image list --format json     -> image-list.json
+# container logs ccfixtures-31236-api -> logs-api.txt

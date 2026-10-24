@@ -107,6 +107,12 @@ Phases D and E are ordered so a container is never created against a resource
 that does not exist yet. They are not transactional in the other direction: if
 container 3 of 5 fails to create, containers 1 and 2 exist.
 
+`container start` returns before the container is running: the state is still
+`stopped` when the command exits, and `running` a second or two later. The start
+phase therefore polls `list --all` until the service is `running`, and a
+`depends_on: service_started` edge is satisfied by that state rather than by the
+command returning.
+
 ### Partial failure
 
 When phase C–G fails:
@@ -160,12 +166,12 @@ The supervisor is a loop with no threads per service:
 
 ```
 every poll_interval (default 1s):
-    list --format json, filter by project label
+    list --all --format json, filter by project label
     for each service:
         state changed?  → log the transition
-        exited?         → restart per policy, with backoff
+        stopped?        → restart per policy, with backoff
         running?        → run a due healthcheck
-    write nothing; keep the previous state in memory
+    write the health cache only when a state changes; keep the rest in memory
 ```
 
 Restart policy:
@@ -173,13 +179,23 @@ Restart policy:
 | policy | restarts when |
 |---|---|
 | `no` | never. |
-| `on-failure` | the container exits non-zero, or the runtime reports a state that is neither `running` nor a clean `stopped`. Gives up after `max_retries` (default 5). |
+| `on-stop` | the container is not running and this process did not stop it. Gives up after `max_retries` (default 5). |
 | `always` | any exit, including zero. Backoff still applies; there is no attempt limit. |
+
+The runtime records **no exit code**: `list` and `inspect` report `running` or
+`stopped`, nothing more. So a policy that tests the exit status cannot be
+implemented, and `on-stop` is named for what the tool can actually observe. The
+supervisor sets an intent immediately before it stops a service and clears it on
+the next start; a transition to `stopped` without intent is the policy's
+trigger. A `container stop` typed in another terminal is indistinguishable from
+a process exit — that is a runtime gap, not an omission — which is why the
+documented way to stop a supervised service is to stop the supervisor or run
+`down`.
 
 Backoff is 1 s, 2 s, 4 s, 8 s, 16 s, capped at 30 s, reset after the container
 has stayed up for 60 s. A crash loop therefore settles at one restart every
-30 s instead of pinning a core, and the log line names the exit code and the
-attempt count.
+30 s instead of pinning a core, and the log line names the attempt count and the
+last health result.
 
 Healthchecks are `container exec` calls on a schedule, because the runtime has
 no healthcheck of its own. A healthcheck is only meaningful while the container
@@ -187,6 +203,21 @@ runs; an exited container is `unknown`, not `unhealthy`. An unhealthy service is
 reported in `ps`, blocks `depends_on: service_healthy` for anything that comes
 after it, and does **not** trigger a restart in v1 — restarting a service because
 its probe is slow is how a dev loop turns into a flapping loop.
+
+A probe has three outcomes, not two. Exit 0 is healthy. A non-zero exit is a
+failed probe and counts toward `retries`. `container exec` failing because the
+container is not running is `unknown` and counts for nothing. A probe binary
+that does not exist also exits non-zero, and is worth naming separately: the
+healthcheck can never pass, and the message says which binary is missing.
+
+Health is a property of the supervision session, not of the container, because
+nothing in the runtime records it. The supervisor writes a small per-project
+cache — `~/Library/Caches/container-compose/<project>.json`, holding its pid and
+the last result per service — and `ps` reads it. A missing file, a pid that is
+gone, or a config-hash mismatch means `unknown`, never a stale "healthy". The
+cache is never authority: `up` readiness uses in-process state, deleting the
+file changes only what `ps` prints, and failing to write it warns rather than
+failing the stack.
 
 ### Ctrl-C
 
@@ -203,13 +234,13 @@ Foreground `up` never deletes. Stopping is reversible; deletion belongs to
 
 ## Constraints the model accepts
 
-**One writer per named volume.** The runtime documents named volumes and
-mounting them, but not concurrent attachment of the same volume by two
-containers. The tool therefore validates that a volume is mounted by at most one
-service unless the extra mounts are read-only, and read-only sharing is marked
-"verify on the real runtime before relying on it" in
-[`05-testing.md`](05-testing.md). A stack that needs two writers uses one
-container running both processes, or a host bind mount.
+**One running container per named volume.** Measured on the runtime: a second
+container cannot attach a volume that a running container holds, even
+read-only — `start` fails with `The storage device attachment is invalid`. A
+stopped holder releases it. The tool therefore validates that a volume is
+mounted by at most one service, `:ro` included. A stack that needs two services
+to see the same data uses a host bind mount, which the runtime does document as
+shareable, or one container running both processes.
 
 **No cross-project sharing.** A volume or network belongs to exactly one
 project. Two stacks that need the same data share it through a bind mount, where
@@ -225,8 +256,9 @@ project instead.
 
 ## What is deliberately absent
 
-- **No daemon.** State lives in the runtime and in the labels; the tool keeps
-  nothing between invocations.
+- **No daemon.** The runtime and the labels are the authority; the tool keeps
+  nothing between invocations except the supervisor's health cache, which only
+  `ps` reads and the next `up` rebuilds.
 - **No Compose YAML.** See
   [`02-stack-file.md`](02-stack-file.md#why-not-compose-yaml).
 - **No launchd integration.** Generating a LaunchAgent that runs `up` in the

@@ -1,0 +1,14 @@
+[package]
+name = "container-compose-plan"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "Plan steps and reconcile decisions for a resolved stack"
+
+[dependencies]
+container-compose-runtime.workspace = true
+container-compose-stack.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

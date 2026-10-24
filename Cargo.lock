@@ -151,11 +151,32 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "container-compose-plan",
+ "container-compose-runtime",
  "container-compose-stack",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "container-compose-plan"
+version = "0.1.0"
+dependencies = [
+ "container-compose-runtime",
+ "container-compose-stack",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "container-compose-runtime"
+version = "0.1.0"
+dependencies = [
+ "container-compose-stack",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -225,6 +246,15 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "fake-container"
+version = "0.1.0"
+dependencies = [
+ "container-compose-runtime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

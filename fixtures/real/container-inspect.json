@@ -1,0 +1,249 @@
+[
+  {
+    "configuration" : {
+      "capAdd" : [
+
+      ],
+      "capDrop" : [
+
+      ],
+      "creationDate" : "2026-10-24T04:25:54Z",
+      "dns" : {
+        "nameservers" : [
+
+        ],
+        "options" : [
+
+        ],
+        "searchDomains" : [
+
+        ]
+      },
+      "id" : "ccfixtures-31236-api",
+      "image" : {
+        "descriptor" : {
+          "digest" : "sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+          "mediaType" : "application/vnd.oci.image.index.v1+json",
+          "size" : 9218
+        },
+        "reference" : "docker.io/library/alpine:latest"
+      },
+      "initProcess" : {
+        "arguments" : [
+          "-c",
+          "echo capture-hello; exec sleep 120"
+        ],
+        "environment" : [
+          "CAPTURE_MARKER=present",
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "executable" : "/bin/sh",
+        "rlimits" : [
+
+        ],
+        "supplementalGroups" : [
+
+        ],
+        "terminal" : false,
+        "user" : {
+          "id" : {
+            "gid" : 0,
+            "uid" : 0
+          }
+        },
+        "workingDirectory" : "/"
+      },
+      "labels" : {
+        "dev.container-compose.config" : "capture",
+        "dev.container-compose.project" : "ccfixtures-31236",
+        "dev.container-compose.schema" : "1",
+        "dev.container-compose.service" : "api"
+      },
+      "mounts" : [
+        {
+          "destination" : "/data",
+          "options" : [
+
+          ],
+          "source" : "/Users/damo/Library/Application Support/com.apple.container/volumes/ccfixtures-31236-vol/volume.img",
+          "type" : {
+            "volume" : {
+              "cache" : {
+                "on" : {
+
+                }
+              },
+              "format" : "ext4",
+              "name" : "ccfixtures-31236-vol",
+              "sync" : {
+                "fsync" : {
+
+                }
+              }
+            }
+          }
+        }
+      ],
+      "networks" : [
+        {
+          "network" : "ccfixtures-31236-net",
+          "options" : {
+            "aliases" : [
+              "api.ccfixtures-31236.test"
+            ],
+            "hostname" : "ccfixtures-31236-api",
+            "mtu" : 1280
+          }
+        }
+      ],
+      "platform" : {
+        "architecture" : "arm64",
+        "os" : "linux"
+      },
+      "publishedPorts" : [
+
+      ],
+      "publishedSockets" : [
+
+      ],
+      "readOnly" : false,
+      "resources" : {
+        "cpuOverhead" : 1,
+        "cpus" : 4,
+        "memoryInBytes" : 1073741824
+      },
+      "rosetta" : false,
+      "runtimeHandler" : "container-runtime-linux",
+      "ssh" : false,
+      "sysctls" : {
+
+      },
+      "useInit" : true,
+      "virtualization" : false
+    },
+    "id" : "ccfixtures-31236-api",
+    "status" : {
+      "networks" : [
+        {
+          "hostname" : "ccfixtures-31236-api",
+          "ipv4Address" : "192.168.65.2/24",
+          "ipv4Gateway" : "192.168.65.1",
+          "ipv6Address" : "fd2a:6051:e85e:5990:f076:b8ff:fe52:ce92/64",
+          "macAddress" : "f2:76:b8:52:ce:92",
+          "mtu" : 1280,
+          "network" : "ccfixtures-31236-net",
+          "variant" : "reserved"
+        }
+      ],
+      "startedDate" : "2026-10-24T04:25:54Z",
+      "state" : "running"
+    }
+  },
+  {
+    "configuration" : {
+      "capAdd" : [
+
+      ],
+      "capDrop" : [
+
+      ],
+      "creationDate" : "2026-10-24T04:25:54Z",
+      "dns" : {
+        "nameservers" : [
+
+        ],
+        "options" : [
+
+        ],
+        "searchDomains" : [
+
+        ]
+      },
+      "id" : "ccfixtures-31236-worker",
+      "image" : {
+        "descriptor" : {
+          "digest" : "sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+          "mediaType" : "application/vnd.oci.image.index.v1+json",
+          "size" : 9218
+        },
+        "reference" : "docker.io/library/alpine:latest"
+      },
+      "initProcess" : {
+        "arguments" : [
+          "-c",
+          "echo worker-done"
+        ],
+        "environment" : [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "executable" : "/bin/sh",
+        "rlimits" : [
+
+        ],
+        "supplementalGroups" : [
+
+        ],
+        "terminal" : false,
+        "user" : {
+          "id" : {
+            "gid" : 0,
+            "uid" : 0
+          }
+        },
+        "workingDirectory" : "/"
+      },
+      "labels" : {
+        "dev.container-compose.config" : "capture",
+        "dev.container-compose.project" : "ccfixtures-31236",
+        "dev.container-compose.schema" : "1",
+        "dev.container-compose.service" : "worker"
+      },
+      "mounts" : [
+
+      ],
+      "networks" : [
+        {
+          "network" : "ccfixtures-31236-net",
+          "options" : {
+            "aliases" : [
+              "worker.ccfixtures-31236.test"
+            ],
+            "hostname" : "ccfixtures-31236-worker",
+            "mtu" : 1280
+          }
+        }
+      ],
+      "platform" : {
+        "architecture" : "arm64",
+        "os" : "linux"
+      },
+      "publishedPorts" : [
+
+      ],
+      "publishedSockets" : [
+
+      ],
+      "readOnly" : false,
+      "resources" : {
+        "cpuOverhead" : 1,
+        "cpus" : 4,
+        "memoryInBytes" : 1073741824
+      },
+      "rosetta" : false,
+      "runtimeHandler" : "container-runtime-linux",
+      "ssh" : false,
+      "sysctls" : {
+
+      },
+      "useInit" : false,
+      "virtualization" : false
+    },
+    "id" : "ccfixtures-31236-worker",
+    "status" : {
+      "networks" : [
+
+      ],
+      "state" : "stopped"
+    }
+  }
+]

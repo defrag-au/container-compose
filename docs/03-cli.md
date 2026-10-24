@@ -18,6 +18,7 @@ container-compose [global flags] <command> [command flags] [args]
 | `--runtime <path>` | `container` | The `container` binary to invoke. Exists for the fake runtime in [`05-testing.md`](05-testing.md), and for a preview build. |
 | `-v, --verbose` | off | Echo every `container` argv before running it. |
 | `--no-color` | off | Disable ANSI colour. Also honoured from `NO_COLOR`. |
+| `--no-env-check` | off | Skip the git check on the env file. |
 
 `--json` is per-command rather than global, because on some commands it changes
 the output document rather than the formatting.
@@ -66,7 +67,7 @@ container create \
     --label dev.container-compose.config=3f9c1a2b7d4e0055 \
     --label dev.container-compose.schema=1 \
     --network default,alias=sieve \
-    --env RUST_LOG=info,wallet_sieve=debug \
+    --env RUST_LOG \
     --volume mitos-spool:/spool \
     --volume mitos-cache:/cache \
     --volume /Users/damo/code/defrag/mitos/fixtures:/fixtures:ro \
@@ -107,6 +108,13 @@ free-form map; the JSON below is abbreviated, not untyped:
 would be refused (an unowned name, a volume that must be recreated), and 2 when
 the file does not validate. It never exits 4 — nothing has run.
 
+Every refusal is decided in the plan phase, before the first pull, so exit 3
+always means nothing was executed. A name that is taken between the plan and the
+create is a runtime failure (exit 1), not a refusal.
+
+`plan` and `up` also refuse (exit 3) when the env file is tracked by git or not
+ignored; `config` warns instead. `--no-env-check` skips the check.
+
 ## `up`
 
 ```sh
@@ -128,6 +136,10 @@ container-compose up --dry-run
 With a service list, `up` starts those services **and their dependencies**;
 everything else is planned but not started. A service named in the list that
 does not exist is a usage error (exit 2).
+
+Until the supervisor lands (M4), `up` requires `-d`: foreground `up` *is* the
+supervisor, so without the flag the command refuses with exit 3 instead of
+silently detaching.
 
 Progress goes to stderr, one line per step, so stdout stays clean for `--json`:
 
@@ -177,11 +189,17 @@ mitos-sieve    sieve     running  healthy   ghcr.io/defrag/wallet-sieve:0.4.0   
 mitos-ledger   ledger    running  unknown   ghcr.io/defrag/token-ledger:0.4.0
 ```
 
-`HEALTH` is `healthy`, `unhealthy`, `starting`, `unknown` (no healthcheck), or
-`—` (not running). `ps` shows containers belonging to the project even when the
-stack file is absent, which is what makes an interrupted session recoverable.
+`HEALTH` is `healthy`, `unhealthy`, `starting`, `unknown`, or `—` (not running).
+It is not derived from the runtime, which records none: a running supervisor
+publishes the last result per service to
+`~/Library/Caches/container-compose/<project>.json`, and `ps` reads it. No file,
+a dead pid or a config-hash mismatch prints `unknown`, with one footnote naming
+the last observation, if any. `ps` never runs a probe itself. It shows containers belonging to the project
+even when the stack file is absent, which is what makes an interrupted session
+recoverable; health then comes from the cache, or is `unknown`.
 
-`ps --json` emits an array of typed records; no field is a formatted string.
+`ps --json` emits an array of typed records; `health` is an object with `state`,
+`checked_at` and `source` (`supervisor` or `none`), not a formatted string.
 
 ## `logs`
 
@@ -245,10 +263,12 @@ container-compose config
 container-compose config --json
 ```
 
-Prints the resolved stack — defaults filled in, env files expanded, host paths
-absolute, dependency order resolved — without contacting the runtime. Two useful
-properties fall out: `config` works with no `container` installed, and
-`config --json` gives the exact input to the config hash.
+Prints the resolved stack — defaults filled in, substitutions resolved, host
+paths absolute, dependency order resolved — without contacting the runtime. Two
+useful properties fall out: `config` works with no `container` installed, and
+`config --json` is the document tests and diffs compare. Env values are redacted
+in both forms; the `config_hash` printed beside them is computed over the
+unredacted model, so a changed secret still changes the hash.
 
 ## Exit codes
 

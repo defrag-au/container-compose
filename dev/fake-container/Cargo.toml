@@ -1,0 +1,15 @@
+[package]
+name = "fake-container"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "A test double for Apple's container CLI"
+
+[[bin]]
+name = "fake-container"
+path = "src/main.rs"
+
+[dependencies]
+container-compose-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true

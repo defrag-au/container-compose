@@ -23,9 +23,10 @@ by what the first fixture needs, not by what is easiest to write.
   is diagnosable without a second command. The `logs` command itself is M2.
 - The fake runtime and the golden files from
   [`05-testing.md`](05-testing.md), written before the reconcile code.
-- `restart` other than `"no"` is a **load error** that names M2. So is
-  `network.mode = "isolated"`, which names M3. A feature that is not implemented
-  is refused, never ignored.
+- `restart` other than `"no"` and `network.mode = "isolated"` parse and
+  describe normally, but `up` refuses them (exit 3, naming M2/M3) until they are
+  implemented — a load-time refusal would leave `config` unable to describe a
+  valid file. `depends_on: service_healthy` is refused the same way until M2.
 
 **Exit criteria**
 
@@ -53,14 +54,14 @@ what it did.
 - A project lock, so two `up`s cannot supervise the same containers. A second
   `up` on a locked project either attaches (if it is the same terminal) or exits
   3; the lock records a pid and is ignored when that pid is gone.
-- The fixture flips back to `restart = "always"` / `on-failure`, and that is the
+- The fixture flips back to `restart = "always"` / `on-stop`, and that is the
   version the local-stack session runs.
 
 **Exit criteria**
 
 - A service that exits immediately is restarted on the documented backoff and
-  gives up after `max_retries` under `on-failure`, all in a unit test with a
-  fake clock.
+  gives up after `max_retries` under `on-stop`, all in a unit test with a fake
+  clock.
 - A service whose healthcheck fails during `start_period` is not reported
   unhealthy, and one that never becomes healthy makes `up --wait` exit 4.
 - Ctrl-C stops services in reverse order; the second Ctrl-C kills.
@@ -97,8 +98,8 @@ Written down so they are decisions rather than omissions:
   becomes a broken remote one.
 - **A launchd unit generator.** The honest detached mode. It needs the
   supervisor to be crash-safe and to write a log, and that is M2 work first.
-- **Secrets.** No vault, no SOPS, no file provider. `env_file` with a gitignored
-  file is the whole story.
+- **Secrets.** No vault, no SOPS, no file provider. The one `[env]` file,
+  gitignored and checked by git, is the whole story.
 - **Multi-user.** A shared Mac with two people's stacks is a naming and
   permission problem, not an orchestration one.
 - **Kubernetes anything.** `container cluster` exists; it is not this tool.
@@ -114,6 +115,9 @@ spool; `token-ledger` reads the snapshot and the spool.
 ### Host: fetch and build
 
 ```sh
+# once, for the shared spool
+mkdir -p mitos/deploy/local/spool
+
 # once per snapshot
 mkdir -p mitos/deploy/local/snapshot
 export AGGREGATOR_ENDPOINT=https://aggregator.release-mainnet.api.mithril.network/aggregator
@@ -157,6 +161,7 @@ is what the VM runs on Apple silicon.
 
 ```
 snapshot/
+spool/
 ```
 
 The build context is `deploy/local`, and the snapshot lives inside it. Without
@@ -169,9 +174,6 @@ this file every `container build` sends the whole chain database to the builder
 ```toml
 version = 1
 name = "mitos"
-
-[volumes.spool]
-size = "20G"
 
 [volumes.cache]
 size = "20G"
@@ -190,7 +192,7 @@ command = [
   "--tail-db", "/spool/tail.db",
 ]
 env = { RUST_LOG = "info,wallet_sieve=debug" }
-volumes = ["./snapshot:/chain:ro", "spool:/spool", "cache:/cache"]
+volumes = ["./snapshot:/chain:ro", "./spool:/spool", "cache:/cache"]
 ports = ["127.0.0.1:8184:8184"]
 cpus = 4
 memory = "8G"
@@ -223,13 +225,13 @@ env = { RUST_LOG = "info" }
 volumes = [
   "./snapshot:/chain:ro",
   "../../tools/token-ledger/tokens.toml:/config/tokens.toml:ro",
-  "spool:/spool:ro",
+  "./spool:/spool:ro",
   "ledger:/db",
 ]
 ports = ["127.0.0.1:8185:8185"]
 cpus = 4
 memory = "8G"
-restart = "on-failure"
+restart = "on-stop"
 max_retries = 10
 
 [[services.ledger.depends_on]]
@@ -246,16 +248,19 @@ retries = 3
 
 Four details in that file are load-bearing and easy to get wrong:
 
-- **`restart` is the M2 form.** M1 refuses anything but `restart = "no"`, so the
-  first working version of this file sets both services to `no` and flips them
-  back when the supervisor lands.
+- **`restart` is the M2 form.** `up` refuses anything but `restart = "no"`
+  until the supervisor lands, so the first working version of this file sets
+  both services to `no` and flips them back in M2.
 
 - **`--listen 0.0.0.0:…`.** Both binaries default to `127.0.0.1`, which inside a
   container is the container's own loopback. A published port forwards to the
   container's *network* address, so a loopback listener is unreachable. The
   host-side publish stays on `127.0.0.1`, so nothing is exposed to the LAN.
-- **`spool` is read-write for `sieve` and read-only for `ledger`.** One writer,
-  per the rule in [`01-model.md`](01-model.md#constraints-the-model-accepts).
+- **`spool` is a host bind mount**, read-write for `sieve` and read-only for
+  `ledger`. A named volume cannot be attached to two running containers — the
+  probe in [`07-build-plan.md`](07-build-plan.md#d2--one-running-container-per-named-volume-forced)
+  — and a bind mount is the documented sharing path. The directory must exist
+  before `up`; a missing bind source is a load error.
 - **`--index-dir` is omitted.** It defaults to `/opt/tx-index/mainnet`, which
   does not exist here; `wallet-sieve` logs a warning per resolve and falls back
   to decode+hash. Correct for a local stack, and the warning is expected.
@@ -305,17 +310,16 @@ a cost on both sides.
 
 ## What changes when the runtime answers
 
-[`04-runtime.md`](04-runtime.md#facts-to-confirm-in-the-build-session) lists ten
-questions. Three of them could change this document:
+All ten are answered in
+[`04-runtime.md`](04-runtime.md#measured-facts) and the probe detail is in
+[`07-build-plan.md`](07-build-plan.md). Three changed this document:
 
-- If labels are hard to read back from `inspect`, ownership moves to a name
-  prefix plus a single label, and the reconcile table loses a column.
-- If concurrent volume attachment is refused, the mitos fixture collapses to one
-  container running both processes, and the "one writer" rule becomes "one
-  container".
-- If `container start` does not restart an exited container with its original
-  argv, the supervisor recreates instead of starting, and the config hash has to
-  cover everything it already covers — which it does, so the change is local to
-  the restart action.
+- Labels are in `list --all --format json`, so ownership keeps both its label
+  and its name check and the reconcile table is unchanged.
+- Concurrent volume attachment is refused, so the fixture's spool is a host bind
+  mount and the rule is one service per named volume.
+- `start` does restart an exited container with its original argv, so the
+  restart action stays a start. It returns before the container is `running`,
+  so every start polls.
 
-Everything else is a detail inside the adapter.
+Everything else was a detail inside the adapter.

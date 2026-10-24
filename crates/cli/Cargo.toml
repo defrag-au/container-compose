@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+container-compose-plan.workspace = true
+container-compose-runtime.workspace = true
 container-compose-stack.workspace = true
 serde.workspace = true
 serde_json.workspace = true

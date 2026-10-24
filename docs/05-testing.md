@@ -46,8 +46,19 @@ test):
 
 It implements the subset in [`04-runtime.md`](04-runtime.md#minimum-surface-the-tool-requires),
 plus `list`, `logs` and `system version`. `create` records the container as
-`stopped`; `start` as `running`; `stop` as `exited`; `delete` removes it. IDs are
-sequential (`c0001`, `c0002`) so a golden file never depends on a UUID.
+`stopped`; `start` as `running`; `stop` as `stopped`; `delete` removes it. There
+are only two states and no exit code, because the real runtime has only two and
+none. IDs are sequential (`c0001`, `c0002`) so a golden file never depends on a
+UUID.
+
+Two measured behaviours are part of the contract, not details:
+
+- **`start` is asynchronous.** The fake returns with the state still `stopped`
+  and flips to `running` on a later `list`, which is what forces the start phase
+  to poll. A test that relies on `start` returning "running" is testing a
+  runtime that does not exist.
+- **`start` takes one container.** Two arguments is a usage error (exit 64), as
+  on the real command.
 
 Two rules keep it honest:
 
@@ -64,12 +75,14 @@ The fake is a test double, not a shim. It never ships in a release build.
 ### What the contract tests assert
 
 1. **The plan is the argv.** For each fixture, `plan --commands` is compared to a
-   committed golden file, and then `up` is run against the fake and `calls.jsonl`
-   is compared to the same file. The two must agree; a change in either is a
-   deliberate golden update. `program` is asserted separately, so a test proves
-   the binary invoked was the one on `PATH` and not a leftover real `container`.
+   committed golden file, and then `up` is run against the fake and the mutating
+   entries in `calls.jsonl` are compared to the same argv. The two must agree; a
+   change in either is a deliberate golden update. The recorded `program` is
+   canonicalised and compared with the fake's own binary, so a test proves the
+   binary invoked was the fake and not a leftover real `container`.
 2. **Plan makes no changes.** After `plan`, `calls.jsonl` contains only read
-   subcommands: `list`, `inspect`, `system version`.
+   subcommands: `list`, `inspect`, `volume list`, `network list`, `system
+   version`, `system status`.
 3. **Reconcile decisions.** For each row of the adopt/recreate/refuse table in
    [`01-model.md`](01-model.md#adopt-recreate-or-refuse), a `world.json` is set up
    and the exact sequence of mutating calls is asserted. An adopted container
@@ -94,7 +107,7 @@ The fake is a test double, not a shim. It never ships in a release build.
 ### Golden files
 
 ```
-tests/golden/
+fixtures/golden/
     minimal.commands
     minimal.plan
     mitos.commands
@@ -102,9 +115,9 @@ tests/golden/
 ```
 
 `minimal` is an alpine echo service: the smallest stack that exercises create,
-start and stop. `mitos` is the local stack from
-[`06-roadmap.md`](06-roadmap.md#the-first-fixture), with two services, three volumes,
-a healthcheck and a dependency.
+start and stop. `mitos` is a two-service stack shaped like the local stack in
+[`06-roadmap.md`](06-roadmap.md#the-first-fixture), with three volumes — one
+mounted by each service — healthchecks and a dependency.
 
 Goldens are regenerated only with an explicit flag (`UPDATE_GOLDEN=1`), and the
 diff is read before it is committed — the same posture as the generated widget
@@ -147,9 +160,17 @@ fn tick(&mut self, now: Instant, observed: &[Observed]) -> Vec<Action>;
 
 `now` is passed in, so a crash loop is tested by advancing a fake clock, not by
 sleeping. Assertions: the backoff sequence is 1, 2, 4, 8, 16, 30, 30; `always`
-never gives up; `on-failure` gives up after `max_retries`; a container that
-stays up for 60 s resets the backoff; an exit code of 0 does not restart under
-`on-failure`; a service in `start_period` is not reported unhealthy.
+never gives up; `on-stop` gives up after `max_retries`; a container that stays
+up for 60 s resets the backoff; a stop the supervisor issued is not restarted; a
+service in `start_period` is not reported unhealthy; a missing or stale health
+cache makes `ps` print `unknown` rather than the last value.
+
+There is no exit-code test: the runtime does not expose one.
+
+**The env file.** A tracked file, and an untracked file that is not ignored, are
+both refused by `plan`/`up` and warned about by `config`; a `.gitignore` entry
+makes the same file accepted. The guard is three `git` questions against a
+fixture repository, not a pattern match on the path.
 
 **Signal handling.** The signal loop is a function of an event channel, so tests
 push `SigInt` and assert the stop order, then push a second and assert `kill`.
@@ -178,7 +199,7 @@ against the fake:
 | bind mount visibility and uid/gid mapping | virtiofs semantics and ownership are the runtime's. |
 | published ports reachable from loopback | the proxy is outside the container. |
 | `.test` name resolution and aliases | the DNS service is host-level, with an `/etc/resolver` entry. |
-| volume sharing between containers | undocumented; the answer decides the one-writer rule. |
+| sharing a host bind mount between two containers | the documented sharing path once named volumes are out; verified in M3. |
 | `--cpus` / `--memory` actually limiting | cgroup enforcement inside the VM. |
 | `exec` with a TTY | terminal handling. |
 | log following after a container stops | runtime buffering. |
@@ -186,9 +207,11 @@ against the fake:
 
 The smoke test is one stack: `alpine` with `sleep`, a bind mount, a published
 port, a `tmpfs`, and a healthcheck that succeeds. It asserts the things a fake
-cannot: the file is visible in the mount, the port answers, `ps` says `healthy`,
-`down` removes the container, and the volume survives unless `--volumes` is
-given.
+cannot: the file is visible in the mount, the port answers, `up` reports the
+healthcheck passing, `down` removes the container, and a volume survives unless
+`--volumes` is given. Health in `ps` comes from the supervisor's cache, so the
+smoke test either keeps `up` running or accepts `unknown`; it does not expect a
+probe to run from a separate `ps` process.
 
 Integration tests use a project name with a per-run suffix
 (`cc-smoke-<pid>`), so a failed run cannot collide with the next one, and they
@@ -198,13 +221,11 @@ leak is named in the failure output.
 ## Test layout
 
 ```
-src/…                       unit tests in `#[cfg(test)] mod tests`
-tests/plan.rs               golden plans and argv
-tests/reconcile.rs          adopt / recreate / refuse
-tests/supervisor.rs         tick-driven state machine
-tests/validation.rs         table-driven invalid stacks
-tests/smoke.rs              #[ignore], real runtime
-tests/golden/               committed fixtures
+crates/stack/src/…          unit tests in `#[cfg(test)] mod tests`
+crates/stack/tests/         validation and hash
+crates/cli/tests/           the binary end to end
+crates/*/tests/             the crate that owns the action — plan, reconcile, supervisor
+fixtures/                   shared stack fixtures, committed and readable
 dev/fake-container/         the test double
 ```
 

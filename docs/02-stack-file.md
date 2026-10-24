@@ -18,10 +18,6 @@ name = "mitos"
 [network]
 mode = "default"                 # "default" | "isolated"
 
-[volumes.spool]
-size = "200G"
-journal = "ordered"
-
 [volumes.cache]
 size = "20G"
 
@@ -32,7 +28,7 @@ size = "100G"
 image = "ghcr.io/defrag/wallet-sieve:0.4.0"
 command = ["wallet-sieve", "serve", "--db", "/cache/sieve.db", "--immutable", "/chain/db/immutable"]
 env = { RUST_LOG = "info,wallet_sieve=debug" }
-volumes = ["spool:/spool", "cache:/cache", "./fixtures:/fixtures:ro"]
+volumes = ["./spool:/spool", "cache:/cache", "./fixtures:/fixtures:ro"]
 ports = ["127.0.0.1:8184:8184"]
 aliases = ["sieve"]
 cpus = 4
@@ -52,8 +48,8 @@ retries = 4
 image = "ghcr.io/defrag/token-ledger:0.4.0"
 command = ["token-ledger", "serve", "--data-dir", "/chain", "--tail-db", "/spool/tail.db"]
 env = { RUST_LOG = "info" }
-volumes = ["spool:/spool:ro", "ledger:/db"]
-restart = "on-failure"
+volumes = ["./spool:/spool:ro", "ledger:/db"]
+restart = "on-stop"
 max_retries = 10
 
 [[services.ledger.depends_on]]
@@ -69,6 +65,7 @@ condition = "service_healthy"
 | `name` | string | directory name | Project name; see the naming rule in [`01-model.md`](01-model.md#naming). |
 | `[network]` | table | absent | Network selection; absent means the runtime's `default` network. |
 | `[volumes]` | table of tables | `{}` | Named volumes this project owns. |
+| `[env]` | table | absent | The one env file, as a substitution source. |
 | `[services]` | table of tables | required, non-empty | One container per service. |
 
 `version` exists so the file can change shape later without guessing. An unknown
@@ -150,9 +147,8 @@ never pushes anything.
 | key | type | meaning |
 |---|---|---|
 | `command` | array of strings | Overrides the image's command. Never a shell string. |
-| `entrypoint` | array of strings | Overrides the image's entrypoint. Never a shell string. |
-| `env` | table of strings | Environment variables. Values must be strings. |
-| `env_file` | array of strings | Files of `KEY=value`, resolved relative to the stack file. Later files win; `env` wins over every file. |
+| `entrypoint` | string | The executable that replaces the image's entrypoint. One string, because that is what `--entrypoint` takes. |
+| `env` | table of strings | Environment variables. Values must be strings, and `${VAR}` is substituted before the value is used. |
 | `user` | string | `uid[:gid]` or `name[:group]`, as `container` accepts. |
 | `workdir` | string | Working directory. |
 | `init` | bool | Run the runtime's init process (`--init`). |
@@ -160,16 +156,44 @@ never pushes anything.
 | `cap_add` / `cap_drop` | array of strings | Linux capabilities, passed through. |
 | `ulimits` | array of strings | `<type>=<soft>[:<hard>]`, passed through verbatim. |
 
-`command` and `entrypoint` are argv arrays, not strings. A string would invite
-`sh -c`, and `sh -c` turns a quoting bug into a different program. If a service
-needs a shell, it writes `["/bin/sh", "-c", "..."]` and the choice is visible.
+`command` is an argv array, not a string. A string would invite `sh -c`, and
+`sh -c` turns a quoting bug into a different program. If a service needs a
+shell, it writes `["/bin/sh", "-c", "..."]` and the choice is visible.
 
-`env_file` entries are read and merged by the tool, then passed as `--env
-KEY=value` rather than `--env-file`. That makes the precedence a rule the tool
-enforces instead of a rule the runtime does not document, and it keeps
-`plan --commands` honest. The cost is that a value from the file appears in the
-argv, visible to `ps` on the same machine; a local dev stack is not a secret
-store, and a production secret does not belong in one.
+`entrypoint` is a single string because the runtime's `--entrypoint` takes one,
+and it is **not** split on spaces: `--entrypoint "/bin/echo pre"` tries to run a
+binary with that whole name. A multi-word entrypoint is expressed as an explicit
+`command` instead.
+
+### Environment, and the one file that may hold secrets
+
+There is **one env file per stack**: `[env] file`, default `.env` beside the
+stack file. There are no per-service env files. A new secret-shaped filename is
+a new `.gitignore` rule to get wrong, and `.env.<service>` is not covered by the
+common `.env` pattern. Scoping is explicit in the stack file:
+
+```toml
+[env]
+file = ".env"
+
+[services.sieve.env]
+API_KEY = "${SIEVE_API_KEY}"
+```
+
+`${NAME}` resolves from the process environment first, then the file, so a
+secrets manager that injects variables needs no file at all. A name that is in
+neither is a load error naming the key, not an empty string.
+
+Values reach the runtime as `--env NAME` — the inherit form — and each
+`container` child is spawned with only that service's variables. A value
+therefore never appears in `plan --commands`, in `ps`, or in a golden file. It
+does appear in the container's config, which `container inspect` shows; the
+runtime has no secret store, and a local dev stack is not one.
+
+Before a command passes values to the runtime, the tool asks git whether the
+file is safe: tracked, or untracked and not ignored, is refused (exit 3) with
+the fix in the message. `config` warns instead, because it must work without
+git.
 
 ### Storage
 
@@ -183,9 +207,12 @@ Relative bind paths resolve against the directory holding `stack.toml`, not the
 shell's working directory, so `cd` cannot change what a stack means. A bind
 source that does not exist is a load error.
 
-A volume used by more than one service must be `:ro` on all but one of them.
-The runtime documents mounting and does not document concurrent attachment; see
-[`01-model.md`](01-model.md#constraints-the-model-accepts).
+A volume may be mounted by **one service**. The runtime refuses a second
+*attachment* while the first container runs, even with `:ro` — `start` fails
+with `The storage device attachment is invalid`. A stopped container releases
+the volume, which is no use to a stack that starts together. Two services that
+need the same data use a host bind mount, which the runtime documents as
+shareable, or one container running both processes.
 
 ### Network
 
@@ -203,8 +230,14 @@ the tool adds the failing publish spec to its message.
 | key | type | default | meaning |
 |---|---|---|---|
 | `depends_on` | array of tables | `[]` | Ordering constraints. |
-| `restart` | `"no"` \| `"on-failure"` \| `"always"` | `"no"` | Tool-level restart policy. |
-| `max_retries` | integer | `5` | Only for `on-failure`. |
+| `restart` | `"no"` \| `"on-stop"` \| `"always"` | `"no"` | Tool-level restart policy. |
+| `max_retries` | integer | `5` | Only for `on-stop`. |
+
+The runtime records no exit code, so `on-stop` means "restart whenever the
+service is not running and this supervisor did not stop it", not "restart on a
+non-zero exit". `always` is the same without the retry cap. A stop typed into
+another terminal is treated as unexpected, because the runtime offers no way to
+tell the two apart.
 | `healthcheck` | table | absent | Probe run with `container exec`. |
 | `labels` | table of strings | `{}` | Extra labels, merged with the tool's. |
 
@@ -252,10 +285,10 @@ Every rule below fails the load; none of them is a warning except where stated.
 | `depends_on` names exist, no self, no cycle | `[services.<name>.depends_on]` |
 | `service_healthy` only where a healthcheck exists | the dependency entry |
 | every `volumes` source is either a declared volume or an existing host path | the entry |
-| at most one writer per declared volume | the second entry |
+| at most one service per declared volume | the second entry |
 | `size` / `memory` parse as sizes; `cpus > 0`; `retries >= 1` | the key |
 | `ports` parse; no duplicate host bindings inside the stack | the entry |
-| `env_file` exists; `env` keys match `[A-Za-z_][A-Za-z0-9_]*` | the file or key |
+| `[env] file` exists; `${VAR}` in `env` resolves; `env` keys match `[A-Za-z_][A-Za-z0-9_]*` | the file or key |
 | `labels` do not start with `dev.container-compose.` | the label |
 | `subnet` only with `mode = "isolated"` | `[network]` |
 | durations parse as `ms`, `s`, `m`, `h` | the key |
@@ -283,8 +316,8 @@ the project name (it is already a label), the file's comments and whitespace.
 
 Including env values means a changed `.env` recreates the container, which is
 the behaviour people expect and the reason the hash is not taken over the file
-text. The label holds a digest, not the values; a secret in `env` or `env_file`
-is not printed by `plan`, `ps` or `up`.
+text. The label holds a digest, not the values; a secret in `env` or the
+`[env]` file is not printed by `plan`, `ps`, `config` or `up`.
 
 Volume `size` and `journal` are **not** part of the container hash — they belong
 to the volume, and a mismatch is reported separately by the volume reconciler

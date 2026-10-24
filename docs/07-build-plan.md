@@ -1,12 +1,13 @@
 # 07 — Build plan
 
-Status: **M0 and M1 complete, 2026-10-24.** The runtime probe is done, and the
-stack model, parser, validator, resolver, hash and `config` command are built
-(65 tests, `cargo clippy -D warnings` clean). `plan` and the runtime adapter are
-next. This document records what the runtime actually does, the design changes
-that follow, and the order the build goes in. It supersedes the corresponding
-rows of `01`–`05` where they disagree; the deltas are listed first so they are
-not missed.
+Status: **M0, M1, M2 and M3 complete, 2026-10-24.** The runtime probe is done;
+the stack model, parser, validator, resolver, hash and `config` command are built;
+and the runtime adapter, the fake runtime, `plan`, and `up -d` / `down` / `ps` are
+built (106 tests, `cargo clippy -D warnings` clean). The supervisor, healthchecks
+and `exec`/`run`/`build`/`pull` are next. This document records what the runtime
+actually does, the design changes that follow, and the order the build goes in. It
+supersedes the corresponding rows of `01`–`05` where they disagree; the deltas are
+listed first so they are not missed.
 
 The probe used `container` 1.6.0 (Homebrew) on macOS 27.0.1, arm64, with the
 recommended kernel installed. Every JSON fragment below is copied from a real
@@ -16,8 +17,10 @@ empty or back to `default` when it finished.
 
 ## Design deltas
 
-Each one is marked **forced** (the runtime behaves this way) or **decision** (a
-choice still to be made).
+All of these are folded into the documents they came from (`01`–`06`); this
+section remains as the record of what the runtime forced and why. Each one is
+marked **forced** (the runtime behaves this way) or **decided** (a choice this
+build settled).
 
 ### D1 — `restart` is `no`, `on-stop` or `always` (decided)
 
@@ -38,7 +41,7 @@ container's exit code to the process that started it (measured: `exit 7` → 7,
 an exit-code policy, for the reasons below, but it is the only way the code is
 ever visible.
 
-#### Why `--attach` does not rescue `on-failure`
+#### Why `--attach` does not rescue an exit-code policy
 
 The exit code is only available to the process that starts the container.
 
@@ -75,8 +78,8 @@ verb and an IPC channel, not v1.
 naming the supervisor pid) rather than stopping containers the supervisor would
 immediately try to restart.
 
-`docs/05-testing.md`'s “an exit code of 0 does not restart under `on-failure`”
-tests an unobservable property and must go whichever option is chosen.
+`docs/05-testing.md`'s exit-code test is gone; it tested an unobservable
+property.
 
 ### D2 — One *running* container per named volume (forced)
 
@@ -137,7 +140,7 @@ service is `running`, bounded (30 s is generous; the probe took ~2–3 s). A
 `depends_on: service_started` edge is satisfied by `running`, not by `start`
 returning.
 
-### D5 — Probe failures have three outcomes (decision)
+### D5 — Probe failures have three outcomes (applied)
 
 Measured behaviour of `container exec`:
 
@@ -409,6 +412,16 @@ validation cases, 7 hash cases and 5 end-to-end `config` cases.
 Exit: `plan --commands` and `calls.jsonl` agree byte for byte; `plan` issues only
 read subcommands; every refusal exits 3 before a mutating call.
 
+**Done.** `crates/runtime/src/{command,argv,observe,labels}.rs`,
+`crates/plan/src/{lib,plan}.rs`, `dev/fake-container`, and `plan` / `plan
+--commands` / `plan --json` in the CLI, with 9 plan rules, 5 end-to-end plan
+cases, 3 argv cases and 5 captured-shape cases.
+`scripts/capture-runtime-fixtures.sh` writes `fixtures/real/` from a real
+runtime, creating one labelled project and deleting exactly that project in a
+trap; `crates/runtime/tests/captured.rs` parses those files through the
+adapter's own types, so a runtime release that stops sending a field the tool
+relies on fails a test rather than a stack.
+
 ### M3 — up, down, ps
 
 - Reconcile network, volumes and containers per the table, with the amended
@@ -419,9 +432,33 @@ read subcommands; every refusal exits 3 before a mutating call.
 - `down`, `down --volumes`, ownership; `ps`, `ps --json` (health `unknown`; the
   supervisor does not exist yet).
 - Port conflict at start is exit 1 with the publish spec named.
+- `up` passes each service's environment to the `container` child process, never
+  to its argv, so a `.env` value reaches the container as `--env KEY` (D7).
+- `--no-recreate` turns a config-hash mismatch into a refusal (exit 3).
+- `up` without `-d` refuses (exit 3) until the supervisor lands in M4: foreground
+  `up` *is* the supervisor, and detaching silently would be a different promise.
 
 Exit: the mitos fixture (with the spool rework) starts two real containers and
 `down` removes exactly them; every adopt/recreate/refuse row has a test.
+
+**Done.** `crates/plan/src/apply.rs` executes the plan; `up`, `down`, `ps` and
+`ps --json` are in the CLI, with `--no-recreate`, `--keep-started`, `--timeout`
+and `--dry-run`. The fake records the value each `--env` flag resolves to, so a
+test proves the `.env` value reached the child process without appearing in an
+argv. `crates/cli/tests/up.rs` covers the reconcile rows, ownership, partial
+failure with and without `--keep-started`, service selection with dependencies,
+the env path, the port-conflict message, and `ps` with and without the stack
+file.
+
+Verified against the real runtime (1.6.0): a two-service, two-volume stack with a
+`service_started` dependency started both containers, `ps` listed both as
+`running`/`unknown`, `down --volumes` stopped and deleted exactly those containers
+and volumes, and a second `down` was a no-op. `container list --all` and `volume
+list` were empty afterwards. The real run used an alpine stack rather than
+`fixtures/mitos`, whose `mitos-local:dev` image is not built on this machine; the
+engine exercised is the same. A `.env` value was also confirmed end to end:
+`container inspect` showed `SMOKE_SECRET=real-secret-value` in the container's
+environment while the create argv carried only `--env SMOKE_SECRET`.
 
 ### M4 — supervisor, readiness, logs
 

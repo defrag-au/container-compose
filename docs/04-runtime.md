@@ -1,9 +1,10 @@
 # 04 — The runtime
 
-Status: design, 2026-10-24. **Apple `container` was not installed on the design
-machine**, so every row below is sourced from upstream documentation, not from a
-local run. Rows marked **verify** are the ones the build session must confirm on
-a real runtime before they are relied on.
+Status: measured, 2026-10-24, against `container` 1.6.0 on macOS 27.0.1 (arm64).
+The original design was written from upstream documentation; the rows below
+carry the measured answer where the probe disagreed with it or settled a
+question. The probe's commands and captured JSON are in
+[`07-build-plan.md`](07-build-plan.md#m0--the-ten-questions).
 
 Sources are the `main`-branch docs (the command reference carries a warning that
 it documents the current branch, not a release):
@@ -38,11 +39,11 @@ cannot be parsed, rather than guessing at a version.
 | capability | available? | mapping in this tool | source |
 |---|---|---|---|
 | create a container without starting it | yes | `container create` — the core of `up`, so config can be written before any process starts | command-reference `container create` |
-| start a stopped container | yes | `container start`; `--attach`/`--interactive` are not used by the supervisor | command-reference `container start` |
+| start a stopped container | yes | `container start` takes exactly one container, and returns before it is `running`; the supervisor polls `list --all` for that state. `--attach` is not used | command-reference `container start`; measured |
 | stop with a grace period | yes | `container stop --time <secs>` (default 5 in the runtime; the tool defaults to 15) | command-reference `container stop` |
 | kill | yes | `container kill` on the second SIGINT | command-reference `container kill` |
 | delete | yes | `container delete`; `--force` only for a container that would not stop | command-reference `container delete` |
-| list, machine-readable | yes | `container list --all --format json` | command-reference `container list` |
+| list, machine-readable | yes | `container list --all --format json` returns the full configuration — labels, env, mounts, networks and aliases, ports, resources and the image digest. One call is enough; per-container `inspect` is not needed | measured |
 | inspect a container | yes, JSON | `container inspect <name>` | command-reference `container inspect` |
 | logs | yes | `container logs [-f] [-n N]` | command-reference `container logs` |
 | exec | yes | `container exec`; healthchecks and `exec` command | command-reference `container exec` |
@@ -66,7 +67,8 @@ cannot be parsed, rather than guessing at a version.
 | image pull | yes | `container image pull` | command-reference `container image pull` |
 | image build | yes, BuildKit | `container build -t … -f … --target … --build-arg …` | command-reference `container build` |
 | registry auth | yes | out of scope; the user runs `container registry login` | command-reference `container registry login` |
-| restart policy | **no** | implemented by the foreground supervisor | no such flag in the command reference |
+| exit code | only via `start --attach` | not used: the code is available only to the process that starts the container, and attach without a TTY emits a signal-forwarding flood | measured |
+| restart policy | **no** | implemented by the foreground supervisor; the runtime records only `running`/`stopped` | no such flag in the command reference; measured |
 | healthcheck | **no** | `container exec` on a schedule | no such flag in the command reference |
 | readiness / `--wait` | **no** | the supervisor polls `list` and runs the probe | no such flag in the command reference |
 | compose / multi-service file | **no** | this tool | the command reference has no `compose` |
@@ -91,12 +93,25 @@ Therefore `restart` is a property of the **tool**, honoured only while the
 supervisor is running. A detached stack cannot heal, which is why
 [`03-cli.md`](03-cli.md#up) refuses `up -d` when a service asks for restarts.
 
+Measured: `list` and `inspect` report only `running` or `stopped` — no `exited`,
+no exit code, no finish time — so a policy that tests the exit status cannot be
+implemented. `start --attach` does propagate the code (7 for `exit 7`), but only
+to the process that starts the container, and a container stopped by
+`container stop` returns 137, so it does not distinguish a manual stop from a
+crash either. `on-stop` is named for what the tool can observe.
+
 ### No healthcheck
 
 There is no `--health-cmd`, no health state in `list`, and no readiness gate.
 The tool runs `container exec <name> <argv>` itself, treats a zero exit as
-healthy, and keeps the result in memory. `ps` shows it; nothing else consumes it
-except `depends_on: service_healthy`.
+healthy, and keeps the result in its per-project cache for `ps`. Nothing else
+consumes it except `depends_on: service_healthy`.
+
+Measured outcomes: exit 0 is healthy; a non-zero exit is a failed probe; `exec`
+on a stopped container exits 1 with `container <name> is not running`, which is
+`unknown` rather than unhealthy. A missing probe binary also exits 1, with
+`failed to find target executable`, and is reported separately because the check
+can never pass.
 
 Consequences worth knowing: a probe is a process start inside the VM, so
 `interval` below a couple of seconds on a heavy image is a bad idea; and a probe
@@ -159,6 +174,10 @@ the publish forwards to the interface on the **first** network attachment — so
 the tool puts the stack network first and never relies on a second attachment
 for a published port.
 
+Measured: a host port that is already bound fails at `start`, not at `create`
+(`Address already in use (errno: 48)`), so `plan` can only catch duplicates
+inside the stack.
+
 ### Aliases
 
 `--network <name>,alias=api,alias=.apps` gives extra DNS names. The rules the
@@ -173,6 +192,11 @@ docs enforce and the tool must therefore validate or pass through untouched:
   change and therefore a recreate;
 - `*` is rejected; the leading-dot form is the subtree form.
 
+Measured: an alias containing a dot is accepted with no `[dns] domain`
+configured, and aliases are stored and reported on a custom network. A
+single-label alias still needs the configured domain, and bare-hostname DNS on a
+custom network remains apple/container#1809.
+
 ## Volumes
 
 Named volumes are ext4 filesystems on a sparse image, 512 GiB by default. They
@@ -185,35 +209,36 @@ is the capacity, not the occupancy. `volume prune` deletes data immediately and
 irrecoverably — the tool never calls it. A volume in use by a container,
 running or stopped, cannot be deleted.
 
-**Sharing a volume between containers is undocumented.** `docs/volumes.md` says
-what a volume is and how to mount it, and says nothing about two containers
-attaching the same one. The design allows at most one writer and marks
-read-only sharing as **verify** on a real runtime. If it turns out concurrent
-attachment is unsupported, the fallback is one container running both
-processes, or a bind mount — both already expressible in the stack file.
+**Sharing a named volume between running containers is refused.** Measured: a
+second container can be created with the mount, but `start` fails with
+`The storage device attachment is invalid` while the first runs, even for `:ro`.
+A stopped holder releases the volume, which is no use to a stack that starts
+together. The tool therefore allows one service per declared volume; sharing
+data between services is a host bind mount (which `docs/volumes.md` does
+describe as shareable) or one container running both processes.
 
-## Facts to confirm in the build session
+## Measured facts
 
-Each of these is cheap to test on a real runtime and would change a detail if it
-came out the other way. They are listed so the build session tests them
-deliberately rather than discovering them in production.
+All ten questions the design left for the build session are answered; the probe
+commands and the captured JSON are in
+[`07-build-plan.md`](07-build-plan.md#m0--the-ten-questions). The answers that
+changed something:
 
-| # | question | why it matters |
-|---|---|---|
-| 1 | Where do labels appear in `container inspect`'s JSON, and what is the exact shape of `list --format json`? | Ownership filtering and config-hash comparison; pin a fixture from a real run. |
-| 2 | Does `container start` on an exited container restart it with its original argv? | The supervisor's restart path. |
-| 3 | Does `container logs` return the stored log of a stopped container? | `down` followed by `logs` is a common debugging path. |
-| 4 | What is `container`'s exit code and stderr shape for "no such container", "name in use", "port already bound"? | Distinguishing exit 1 from exit 3 in the tool. |
-| 5 | Can two containers mount the same named volume, read-only and read-write? | The one-writer rule. |
-| 6 | Does `container image inspect` expose a manifest digest? | Drift reporting when a tag moves. |
-| 7 | Does `--network name,alias=…` work on a custom network? | Whether `isolated` can ever offer names. |
-| 8 | Does `container stop` exit non-zero when the container is already stopped? | Idempotent `down`. |
-| 9 | Does `container delete --force` on a running container return before the VM is gone? | Ordering `down` correctly. |
-| 10 | What does `container system version` print as JSON, and what does it do when the apiserver is down? | The exit-5 gate. |
+| # | answer |
+|---|---|
+| 1 | `list --all --format json` returns the full configuration — labels, env, mounts, networks and aliases, ports, resources and the image digest. One call replaces per-container `inspect`. |
+| 2 | `start` restarts an exited container with its original argv — and returns before it is `running`; poll `list --all`. |
+| 3 | `logs` returns a stopped container's stored output. |
+| 4 | Domain errors are exit 1 with `Error: …` on stderr; usage errors are 64. A bound port fails at `start`. |
+| 5 | A second container cannot attach a volume a running container holds, even `:ro`; a stopped holder releases it. |
+| 6 | `configuration.image.descriptor.digest` carries the manifest digest, also in `list`. |
+| 7 | Aliases are accepted and stored on a custom network; bare-hostname DNS remains #1809. |
+| 8 | `stop` on an already-stopped container exits 0. |
+| 9 | `delete --force` returns with the container gone and the network reference released. |
+| 10 | `system version` omits the apiserver row when it is down; `system status --format json` is the gate. |
 
-Until 1–4 are answered, the runtime adapter keeps the raw JSON in a debug log
-(`--verbose`) and every fixture used by tests is copied from a real run, never
-written from the docs.
+Every fixture used by tests is copied from a real run, never written from the
+docs. The adapter keeps the raw JSON under `--verbose`.
 
 ## Minimum surface the tool requires
 

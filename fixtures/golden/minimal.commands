@@ -1,0 +1,14 @@
+# pull image docker.io/library/alpine:latest
+container image pull docker.io/library/alpine:latest
+# keep network default
+# create container minimal-echo
+container create \
+    --name minimal-echo \
+    --label dev.container-compose.project=minimal \
+    --label dev.container-compose.service=echo \
+    --label dev.container-compose.config=26810107d1c21183 \
+    --label dev.container-compose.schema=1 \
+    --network default \
+    docker.io/library/alpine:latest echo hello
+# start container minimal-echo
+container start minimal-echo

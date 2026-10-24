@@ -1,16 +1,23 @@
 [workspace]
 resolver = "2"
-members = ["crates/stack", "crates/cli"]
+members = [
+    "crates/stack",
+    "crates/runtime",
+    "crates/plan",
+    "crates/cli",
+    "dev/fake-container",
+]
 
 # The workspace is the unit: the stack model is a library with no runtime, no
 # CLI and no I/O beyond reading the file it validates; the binary is a separate
-# crate. `crates/runtime`, `crates/plan` and `crates/supervisor` join this list
-# as they land, and nothing has to move to make room for them.
+# crate. `crates/supervisor` joins this list when the supervisor lands.
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
 [workspace.dependencies]
+container-compose-plan = { path = "crates/plan" }
+container-compose-runtime = { path = "crates/runtime" }
 container-compose-stack = { path = "crates/stack" }
 
 assert_cmd = "2"
