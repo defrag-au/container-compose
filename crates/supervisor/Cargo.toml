@@ -1,0 +1,16 @@
+[package]
+name = "container-compose-supervisor"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "The foreground supervisor: restart policy, health, signals and the project lock"
+
+[dependencies]
+container-compose-runtime.workspace = true
+container-compose-stack.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

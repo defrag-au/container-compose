@@ -1,0 +1,24 @@
+[package]
+name = "container-compose-cli"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "The container-compose binary"
+
+[[bin]]
+name = "container-compose"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+container-compose-plan.workspace = true
+container-compose-runtime.workspace = true
+container-compose-stack.workspace = true
+container-compose-supervisor.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true

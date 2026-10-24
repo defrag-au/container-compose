@@ -1,0 +1,92 @@
+name: CI
+
+# Formatting, lints and the Rust suite, all against the fake runtime in
+# `dev/fake-container`. The one test that needs Apple's `container` on macOS
+# (`crates/cli/tests/smoke.rs`) is `#[ignore]`d, so this runner — Linux, arm64,
+# no runtime installed — can run everything else.
+#
+# The runner is self-hosted, so a pull request's code executes on the box. If
+# this repository ever accepts fork PRs, require approval for them before
+# enabling that path.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+# A superseded run should not sit in the runner's queue behind the one that
+# replaced it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI does not need debug symbols, and dropping them keeps the cache small.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # Fast-fail gate. fmt is seconds; the heavier jobs wait for it, so a
+  # formatting miss never spends a runner slot on clippy or the suite.
+  fmt:
+    name: Fmt
+    runs-on: [self-hosted, netcup-arm]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Matches the devshell this repository is developed in (`defrag-nix`'s
+          # `rust-stable`, rustc 1.99.0). The flake pins the toolchain and this
+          # job mirrors it; bump both together.
+          toolchain: 1.99.0
+          components: rustfmt
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    needs: [fmt]
+    runs-on: [self-hosted, netcup-arm]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+          cache-on-failure: true
+      - name: cargo clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test
+    needs: [fmt]
+    runs-on: [self-hosted, netcup-arm]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+          cache-on-failure: true
+      # The suite builds and drives `dev/fake-container`; nothing here needs a
+      # container runtime, a network or credentials.
+      - name: cargo test
+        run: cargo test --locked --workspace --all-features
