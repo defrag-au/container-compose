@@ -1,0 +1,62 @@
+version = 1
+name = "mitos"
+
+[volumes.spool]
+size = "20G"
+
+[volumes.cache]
+size = "20G"
+
+[volumes.ledger]
+size = "300G"
+
+[services.sieve]
+image = "mitos-local:dev"
+pull = "never"
+command = [
+  "wallet-sieve", "serve",
+  "--listen", "0.0.0.0:8184",
+  "--db", "/cache/sieve.db",
+]
+env = { RUST_LOG = "info,wallet_sieve=debug" }
+volumes = ["spool:/spool", "cache:/cache"]
+ports = ["127.0.0.1:8184:8184"]
+cpus = 4
+memory = "8G"
+ulimits = ["nofile=65536:65536"]
+restart = "on-stop"
+max_retries = 10
+
+[services.sieve.healthcheck]
+exec = ["curl", "-fsS", "http://127.0.0.1:8184/health"]
+interval = "15s"
+timeout = "5s"
+start_period = "20s"
+retries = 4
+
+[services.ledger]
+image = "mitos-local:dev"
+pull = "never"
+command = [
+  "token-ledger", "serve",
+  "--listen", "0.0.0.0:8185",
+  "--db-dir", "/db/auto",
+]
+env = { RUST_LOG = "info" }
+volumes = ["ledger:/db"]
+ports = ["127.0.0.1:8185:8185"]
+cpus = 4
+memory = "8G"
+restart = "on-stop"
+max_retries = 5
+
+[[services.ledger.depends_on]]
+service = "sieve"
+condition = "service_healthy"
+
+[services.ledger.healthcheck]
+exec = ["curl", "-fsS", "http://127.0.0.1:8185/health"]
+interval = "30s"
+timeout = "5s"
+start_period = "30s"
+retries = 3

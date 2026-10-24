@@ -1,9 +1,12 @@
 # 07 — Build plan
 
-Status: **M0 complete, 2026-10-24.** Nothing of the tool is built. This document
-records what the runtime actually does, the design changes that follow, and the
-order the build goes in. It supersedes the corresponding rows of `01`–`05` where
-they disagree; the deltas are listed first so they are not missed.
+Status: **M0 and M1 complete, 2026-10-24.** The runtime probe is done, and the
+stack model, parser, validator, resolver, hash and `config` command are built
+(65 tests, `cargo clippy -D warnings` clean). `plan` and the runtime adapter are
+next. This document records what the runtime actually does, the design changes
+that follow, and the order the build goes in. It supersedes the corresponding
+rows of `01`–`05` where they disagree; the deltas are listed first so they are
+not missed.
 
 The probe used `container` 1.6.0 (Homebrew) on macOS 27.0.1, arm64, with the
 recommended kernel installed. Every JSON fragment below is copied from a real
@@ -342,22 +345,24 @@ stderr verbatim; exit 64 is a usage error, never a stack problem.
 
 ### Layout
 
-One package plus the dev-only fake, as `05-testing.md` implies:
+A workspace, not one package. The stack model has no runtime, no CLI and no
+process spawning, so it is a library; the binary is a crate; and the adapter,
+planner and supervisor join `members` as they land, without anything moving.
 
 ```
-Cargo.toml            root package + [workspace] members = ["dev/fake-container"]
-src/{main,lib}.rs     thin main: clap → dispatch → exit code
-src/stack/            model, parse, validate, size, duration, ports, resolve, hash
-src/plan/             steps, ordering, argv
-src/runtime/          runner, observe, fixture parsers
-src/reconcile/        up/down
-src/supervisor/       tick, health, backoff, signal loop
-src/cli/              one module per command
-tests/golden/
-tests/fixtures/real/  captured from the probe, never written from the docs
+Cargo.toml            [workspace] — `crates/stack` and `crates/cli` today; members grow
+crates/stack/         model, parse, validate, resolve, hash, env, sizes, durations, ports
+crates/cli/           the binary: clap, commands, output, exit codes
+crates/runtime/       M2: the container adapter — argv, JSON, process runner
+crates/plan/          M2/M3: steps, ordering, reconcile decisions
+crates/supervisor/    M4: tick, health, backoff, signal loop
 dev/fake-container/
-scripts/capture-runtime-fixtures.sh
+fixtures/             shared stack fixtures, readable and never generated at test time
 ```
+
+Golden files live with the crate that owns the action being pinned. When `plan`
+lands in M2 they move to `crates/plan/tests/golden/` (or `crates/cli/tests/golden/`
+if the command stays in the binary), not to a top-level `tests/`.
 
 No runtime trait. The fake is a binary on disk, so the adapter stays concrete and
 the argv is genuinely exercised.
@@ -385,13 +390,17 @@ through `serde_json::Value`.
 Exit: the validation table is green, the hash test table is green, `config` runs
 on the mitos fixture, and a test asserts every error names a key path.
 
+**Done.** `crates/stack/src/{model,parse,validate,resolve,hash,env,size,duration,ports}.rs`,
+`crates/stack/src/error.rs`, and `crates/cli/src/{main,cli,error}.rs`, with 30
+validation cases, 7 hash cases and 5 end-to-end `config` cases.
+
 ### M2 — fake runtime and the plan
 
 - `dev/fake-container`: allowlist, `world.json`, `calls.jsonl`, `fail.json`.
   It must model **asynchronous start**, the two-state vocabulary, and the exact
   error strings above; `start` accepts one container and exits 64 for two.
 - `scripts/capture-runtime-fixtures.sh` runs the M0 sequence and writes
-  `tests/fixtures/real/`.
+  `fixtures/real/`.
 - Adapter: `list --all`, `volume list`, `network list`, `system status`,
   `system version`; argv builders for create/start/stop/delete/exec/logs.
 - `plan`, `plan --commands`, `plan --json`; goldens.

@@ -1,32 +1,24 @@
 [workspace]
 resolver = "2"
+members = ["crates/stack", "crates/cli"]
 
-[package]
-name = "container-compose"
+# The workspace is the unit: the stack model is a library with no runtime, no
+# CLI and no I/O beyond reading the file it validates; the binary is a separate
+# crate. `crates/runtime`, `crates/plan` and `crates/supervisor` join this list
+# as they land, and nothing has to move to make room for them.
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-publish = false
-description = "A small orchestration layer over Apple's container runtime"
 
-[lib]
-name = "container_compose"
-path = "src/lib.rs"
+[workspace.dependencies]
+container-compose-stack = { path = "crates/stack" }
 
-[[bin]]
-name = "container-compose"
-path = "src/main.rs"
-
-[dependencies]
+assert_cmd = "2"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 sha2 = "0.10"
-thiserror = "2"
-toml = "0.8"
-
-[dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
 tempfile = "3"
+toml = "0.8"
