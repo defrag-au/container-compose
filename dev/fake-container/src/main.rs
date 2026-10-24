@@ -12,7 +12,9 @@
 //!
 //! - **Unknown flags fail loudly** (exit 64). Every subcommand parses against
 //!   an allowlist, so an adapter that invents a flag fails here rather than on a
-//!   user's machine.
+//!   user's machine. Parsing stops at the first positional: everything after the
+//!   image (or the container in `exec`) is the container's own command, and its
+//!   flags are not the fake's to reject.
 //! - **It never pretends to do work.** No images, no processes, no networking.
 //!   `start` is asynchronous in the same way the real one is: it returns with
 //!   the state still `stopped` and flips on a later `list`.
@@ -160,6 +162,8 @@ fn dispatch(args: &[String], world: &mut World) -> Result<(), Failure> {
     match command {
         "list" | "ls" => list(rest, world),
         "create" => create(rest, world),
+        "run" => run(rest, world),
+        "build" => build(rest),
         "start" => start(rest, world),
         "stop" => stop(rest, world),
         "delete" | "rm" => delete(rest, world),
@@ -194,7 +198,7 @@ fn dispatch(args: &[String], world: &mut World) -> Result<(), Failure> {
 
 fn mutates(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
-        Some("create" | "start" | "stop" | "delete" | "rm" | "list" | "ls") => true,
+        Some("create" | "start" | "stop" | "delete" | "rm" | "list" | "ls" | "run") => true,
         Some("volume" | "network") => matches!(
             args.get(1).map(String::as_str),
             Some("create" | "delete" | "rm")
@@ -239,7 +243,7 @@ fn list(args: &[String], world: &mut World) -> Result<(), Failure> {
 }
 
 fn create(args: &[String], world: &mut World) -> Result<(), Failure> {
-    let parsed = parse(
+    let (parsed, _command) = parse_until_positional(
         args,
         &[
             "--name",
@@ -274,10 +278,6 @@ fn create(args: &[String], world: &mut World) -> Result<(), Failure> {
     let name = parsed
         .last("--name")
         .ok_or_else(|| Failure::usage("`--name` is required"))?;
-    let image = parsed
-        .positionals
-        .first()
-        .ok_or_else(|| Failure::usage("an image is required"))?;
     if world
         .observed
         .containers
@@ -286,6 +286,118 @@ fn create(args: &[String], world: &mut World) -> Result<(), Failure> {
     {
         return Err(Failure::domain(format!("container already exists: {name}")));
     }
+    world
+        .observed
+        .containers
+        .push(container_from(&parsed, name)?);
+    println!("{name}");
+    Ok(())
+}
+
+/// `container run` is create-and-start in one call. The fake creates the
+/// container but never leaves it running: the attached process would have
+/// exited for the call to return, and `--rm` means it is gone.
+fn run(args: &[String], world: &mut World) -> Result<(), Failure> {
+    let (parsed, _command) = parse_until_positional(
+        args,
+        &[
+            "--name",
+            "--label",
+            "-l",
+            "--network",
+            "--env",
+            "-e",
+            "--volume",
+            "-v",
+            "--publish",
+            "-p",
+            "--cpus",
+            "-c",
+            "--memory",
+            "-m",
+            "--ulimit",
+            "--tmpfs",
+            "--shm-size",
+            "--cap-add",
+            "--cap-drop",
+            "--user",
+            "-u",
+            "--workdir",
+            "-w",
+            "--entrypoint",
+            "--debug",
+        ],
+        &[
+            "--init",
+            "--read-only",
+            "--rm",
+            "-i",
+            "-t",
+            "--detach",
+            "-d",
+        ],
+    )?;
+
+    let name = parsed
+        .last("--name")
+        .ok_or_else(|| Failure::usage("`--name` is required"))?;
+    let container = container_from(&parsed, name)?;
+    if !parsed.has("--rm") {
+        if world
+            .observed
+            .containers
+            .iter()
+            .any(|existing| existing.id == name)
+        {
+            return Err(Failure::domain(format!("container already exists: {name}")));
+        }
+        world.observed.containers.push(container);
+    }
+    Ok(())
+}
+
+/// Parse options up to the first positional (the image, or the container for
+/// `exec`), then stop: everything after it is the container's command, and its
+/// own flags are not ours to reject.
+fn parse_until_positional(
+    args: &[String],
+    value_flags: &[&str],
+    bool_flags: &[&str],
+) -> Result<(Parsed, Vec<String>), Failure> {
+    let mut parsed = Parsed::default();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument.starts_with('-') {
+            if value_flags.contains(&argument.as_str()) {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| Failure::usage(format!("`{argument}` needs a value")))?;
+                parsed
+                    .values
+                    .entry(argument.clone())
+                    .or_default()
+                    .push(value.clone());
+                index += 2;
+            } else if bool_flags.contains(&argument.as_str()) {
+                parsed.flags.insert(argument.clone());
+                index += 1;
+            } else {
+                return Err(Failure::usage(format!("unknown flag `{argument}`")));
+            }
+        } else {
+            parsed.positionals.push(argument.clone());
+            return Ok((parsed, args[index + 1..].to_vec()));
+        }
+    }
+    Ok((parsed, Vec::new()))
+}
+
+fn container_from(parsed: &Parsed, name: &str) -> Result<ObservedContainer, Failure> {
+    let image = parsed
+        .positionals
+        .first()
+        .ok_or_else(|| Failure::usage("an image is required"))?;
 
     let mut labels = BTreeMap::new();
     for pair in parsed.all(&["--label", "-l"]) {
@@ -295,7 +407,7 @@ fn create(args: &[String], world: &mut World) -> Result<(), Failure> {
         labels.insert(key.to_owned(), value.to_owned());
     }
 
-    world.observed.containers.push(ObservedContainer {
+    Ok(ObservedContainer {
         id: name.to_owned(),
         configuration: ContainerConfiguration {
             labels,
@@ -307,8 +419,26 @@ fn create(args: &[String], world: &mut World) -> Result<(), Failure> {
             state: "stopped".to_owned(),
             started_date: None,
         },
-    });
-    println!("{name}");
+    })
+}
+
+fn build(args: &[String]) -> Result<(), Failure> {
+    let parsed = parse(
+        args,
+        &[
+            "-t",
+            "--tag",
+            "-f",
+            "--file",
+            "--target",
+            "--build-arg",
+            "--progress",
+        ],
+        &["--no-cache", "--pull", "-q", "--quiet", "--debug"],
+    )?;
+    if parsed.positionals.len() != 1 {
+        return Err(Failure::usage("one build context is required"));
+    }
     Ok(())
 }
 
@@ -413,21 +543,18 @@ fn logs(args: &[String], _world: &mut World) -> Result<(), Failure> {
 }
 
 fn exec(args: &[String], world: &mut World) -> Result<(), Failure> {
-    let parsed = parse(
+    let (parsed, _command) = parse_until_positional(
         args,
+        &[],
         &[
-            "--env",
-            "-e",
-            "--env-file",
-            "--gid",
-            "-u",
-            "--user",
-            "--uid",
-            "--workdir",
-            "-w",
+            "-i",
+            "--interactive",
+            "-t",
+            "--tty",
+            "-d",
+            "--detach",
             "--debug",
         ],
-        &["--detach", "-d", "--interactive", "-i", "--tty", "-t"],
     )?;
     let Some(name) = parsed.positionals.first() else {
         return Err(Failure::usage("a container id is required"));
@@ -748,7 +875,7 @@ fn record(dir: &Path, argv: &[String]) {
 
 fn resolved_env(argv: &[String]) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    if argv.first().map(String::as_str) != Some("create") {
+    if !matches!(argv.first().map(String::as_str), Some("create" | "run")) {
         return env;
     }
     let mut index = 1;

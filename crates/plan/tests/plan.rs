@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use container_compose_plan::{plan, Action, Plan};
+use container_compose_plan::{plan, Action, Detail, Plan, Resource};
 use container_compose_runtime::labels;
 use container_compose_runtime::{
     ContainerConfiguration, ContainerImage, ContainerStatus, ImageConfiguration,
@@ -274,6 +274,116 @@ fn restart_and_service_healthy_are_planned_now() {
         .steps
         .iter()
         .any(|step| step.action == Action::Start && step.name == "health-b"));
+}
+
+fn network(name: &str, project: Option<&str>, subnet: &str) -> ObservedNetwork {
+    let mut labels = BTreeMap::new();
+    if let Some(project) = project {
+        labels.insert(labels::PROJECT.to_owned(), project.to_owned());
+    }
+    ObservedNetwork {
+        id: name.to_owned(),
+        configuration: NetworkConfiguration {
+            labels,
+            ipv4_subnet: None,
+        },
+        status: Some(NetworkStatus {
+            ipv4_subnet: Some(subnet.to_owned()),
+        }),
+    }
+}
+
+const ISOLATED: &str = "version = 1\nname = \"iso\"\n[network]\nmode = \"isolated\"\nsubnet = \"192.168.77.0/24\"\n[services.a]\nimage = \"img\"\n";
+
+#[test]
+fn an_absent_isolated_network_is_created_and_warns_about_dns() {
+    let (_dir, stack) = temp_stack(ISOLATED);
+    let mut world = world();
+    with_image(&mut world, "img");
+
+    let plan = plan(&stack, &world);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+
+    let create = plan
+        .steps
+        .iter()
+        .find(|step| step.action == Action::Create && step.resource == Resource::Network)
+        .expect("the network is created");
+    assert_eq!(create.name, "iso-net");
+    let argv = create.argv.as_ref().expect("create carries argv");
+    assert!(
+        argv.windows(2)
+            .any(|pair| pair == ["--subnet", "192.168.77.0/24"]),
+        "{argv:?}"
+    );
+
+    let warning = plan
+        .steps
+        .iter()
+        .find(|step| step.action == Action::Warn)
+        .expect("the DNS caveat is a warning");
+    match &warning.detail {
+        Detail::Note { message } => assert!(message.contains("apple/container#1809")),
+        other => panic!("expected a note, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_isolated_network_we_own_with_the_declared_subnet_is_kept() {
+    let (_dir, stack) = temp_stack(ISOLATED);
+    let mut world = world();
+    with_image(&mut world, "img");
+    world
+        .networks
+        .push(network("iso-net", Some("iso"), "192.168.77.0/24"));
+
+    let plan = plan(&stack, &world);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.action == Action::Keep && step.resource == Resource::Network));
+}
+
+#[test]
+fn an_isolated_network_with_a_different_subnet_is_refused() {
+    let (_dir, stack) = temp_stack(ISOLATED);
+    let mut world = world();
+    with_image(&mut world, "img");
+    world
+        .networks
+        .push(network("iso-net", Some("iso"), "192.168.99.0/24"));
+
+    let plan = plan(&stack, &world);
+    assert!(
+        plan.refusals
+            .iter()
+            .any(|refusal| refusal.path == "[network].subnet"),
+        "{:?}",
+        plan.refusals
+    );
+}
+
+#[test]
+fn a_foreign_network_is_attached_only_when_its_subnet_matches() {
+    let (_dir, stack) = temp_stack(ISOLATED);
+    let mut world = world();
+    with_image(&mut world, "img");
+    world
+        .networks
+        .push(network("iso-net", None, "192.168.77.0/24"));
+    let matching = plan(&stack, &world);
+    assert!(matching.refusals.is_empty(), "{:?}", matching.refusals);
+
+    world.networks.pop();
+    world
+        .networks
+        .push(network("iso-net", None, "192.168.99.0/24"));
+    let mismatched = plan(&stack, &world);
+    assert!(mismatched
+        .refusals
+        .iter()
+        .any(|refusal| refusal.path == "[network]"));
 }
 
 #[test]

@@ -183,13 +183,12 @@ does the same with `--no-stop-on-exit`. No test signals the test process itself.
 Real-runtime tests are `#[ignore]` and run explicitly:
 
 ```sh
-cargo test -- --ignored
-CONTAINER_COMPOSE_REAL=1 cargo test --test smoke
+cargo test -p container-compose-cli --test smoke -- --ignored --nocapture
 ```
 
-They require `container` installed, `container system start`, and macOS 26. On a
-machine without it, the binary is absent and the tests skip with a printed
-reason rather than fail — a test that fails on a design machine teaches people
+The smoke test needs `container` installed and `container system start`. On a
+machine without it, it prints a reason and returns rather than fail — a test that
+fails on a design machine teaches people
 to ignore failures.
 
 What is genuinely integration-only, and is therefore tested here rather than

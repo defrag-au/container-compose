@@ -183,8 +183,7 @@ teardown. Stop the supervisor first.
 ## `ps`
 
 ```sh
-container-compose ps
-container-compose ps --json
+container-compose ps [--json] [--probe]
 ```
 
 ```
@@ -198,12 +197,18 @@ It is not derived from the runtime, which records none: a running supervisor
 publishes the last result per service to
 `~/Library/Caches/container-compose/<project>.json`, and `ps` reads it. No file,
 a dead pid or a config-hash mismatch prints `unknown`, with one footnote naming
-the last observation, if any. `ps` never runs a probe itself. It shows containers belonging to the project
-even when the stack file is absent, which is what makes an interrupted session
-recoverable; health then comes from the cache, or is `unknown`.
+the last observation, if any. `ps` never runs a probe itself unless `--probe` is
+given, which runs each healthcheck now and reports `source: "probe"`. It shows
+containers belonging to the project even when the stack file is absent, which is
+what makes an interrupted session recoverable; health then comes from the cache,
+or is `unknown`.
+
+A kept one-off `run` container is shown only while it is running; `down` ignores
+it.
 
 `ps --json` emits an array of typed records; `health` is an object with `state`,
-`checked_at` and `source` (`supervisor` or `none`), not a formatted string.
+`checked_at` and `source` (`supervisor`, `probe`, or `none`), not a formatted
+string.
 
 ## `logs`
 
@@ -241,10 +246,15 @@ container-compose run --keep api -- sh
 
 A one-off container with the service's configuration, named
 `<project>-<service>-run`, attached to the terminal, with the project's network
-and volumes. It is not supervised and is removed on exit unless `--keep` is
+and bind mounts. It is not supervised and is removed on exit unless `--keep` is
 given. `-T` disables the TTY as in `exec`. It is not part of the stack: `ps`
 shows it only while it lives, `down` does not know about it, and a second
 concurrent `run` of the same service is refused rather than silently named twice.
+
+A service that mounts a **named volume** cannot be `run` while its own container
+is running: the runtime allows only one running holder of a named volume, so
+`run` refuses with exit 3 and points at `exec` instead. Bring the service down,
+or use `exec` for a shell in the running container.
 
 ## `build` and `pull`
 
@@ -259,7 +269,8 @@ dependency order. `--no-cache` is passed through. Services without a build
 table are skipped, not an error.
 
 `pull` runs `container image pull` for each service with `pull != "never"`.
-A `pull = "never"` service is skipped and reported as such.
+A `pull = "never"` service is skipped and reported as such, and a service with a
+`build` table is skipped because its image is built locally.
 
 Both accept `--dry-run` and print the argv they would use.
 

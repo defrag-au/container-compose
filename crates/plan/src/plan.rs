@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use container_compose_runtime::{argv, Observed};
+use container_compose_runtime::{argv, labels, Observed};
 use container_compose_stack::model::{NetworkMode, PullPolicy};
 use container_compose_stack::resolve::{Journal, ResolvedService, ResolvedStack, ResolvedVolume};
 use serde::Serialize;
@@ -159,7 +159,7 @@ pub fn plan_with(stack: &ResolvedStack, observed: &Observed, options: &Options) 
     let mut starts: Vec<(String, String)> = Vec::new();
 
     plan_images(stack, observed, &mut steps, &mut refusals);
-    plan_network(stack, observed, &mut steps, &mut refusals);
+    plan_network(stack, observed, &mut steps, &mut refusals, &mut warnings);
     plan_volumes(stack, observed, &mut steps, &mut refusals);
 
     for name in &stack.order {
@@ -289,7 +289,7 @@ fn plan_images(
                     reference: service.image.clone(),
                     action: "build".to_owned(),
                 },
-                Some(argv::build_image(&service.image, build)),
+                Some(argv::build_image(&service.image, build, false)),
             ));
             continue;
         }
@@ -331,6 +331,7 @@ fn plan_network(
     observed: &Observed,
     steps: &mut Vec<Step>,
     refusals: &mut Vec<Refusal>,
+    warnings: &mut Vec<Step>,
 ) {
     match stack.network.mode {
         NetworkMode::Default => {
@@ -350,9 +351,78 @@ fn plan_network(
             ));
         }
         NetworkMode::Isolated => {
-            refusals.push(Refusal::new(
-                "[network].mode",
-                "isolated networks are not implemented yet (M5); use `mode = \"default\"`",
+            let detail = Detail::Network {
+                mode: "isolated".to_owned(),
+                subnet: stack.network.subnet.clone(),
+            };
+            match observed.network(&stack.network.name) {
+                None => steps.push(Step::new(
+                    Action::Create,
+                    Resource::Network,
+                    stack.network.name.clone(),
+                    detail,
+                    Some(argv::create_network(stack)),
+                )),
+                Some(found) => {
+                    let ours = found.project() == Some(stack.name.as_str());
+                    let declared = stack.network.subnet.as_deref();
+                    let observed_subnet = found.subnet();
+                    if ours {
+                        if declared.is_some() && observed_subnet != declared {
+                            refusals.push(Refusal::new(
+                                "[network].subnet",
+                                format!(
+                                    "declared subnet {}, network is {}; a subnet is a \
+                                     creation-time property, and applying it would delete the \
+                                     network",
+                                    declared.unwrap_or("none"),
+                                    observed_subnet.unwrap_or("none")
+                                ),
+                            ));
+                        } else {
+                            steps.push(Step::new(
+                                Action::Keep,
+                                Resource::Network,
+                                stack.network.name.clone(),
+                                detail,
+                                None,
+                            ));
+                        }
+                    } else if declared.is_some() && observed_subnet == declared {
+                        // The documented rule: attach when the subnet matches.
+                        steps.push(Step::new(
+                            Action::Keep,
+                            Resource::Network,
+                            stack.network.name.clone(),
+                            detail,
+                            None,
+                        ));
+                    } else {
+                        refusals.push(Refusal::new(
+                            "[network]",
+                            format!(
+                                "`{}` exists and is not ours (labels: {}); declared subnet {} \
+                                 does not match {}",
+                                stack.network.name,
+                                render_labels(&found.configuration.labels),
+                                declared.unwrap_or("none"),
+                                observed_subnet.unwrap_or("none")
+                            ),
+                        ));
+                    }
+                }
+            }
+            warnings.push(Step::new(
+                Action::Warn,
+                Resource::Network,
+                stack.network.name.clone(),
+                Detail::Note {
+                    message: "isolated network: services reach each other by IP or published \
+                              port; bare-hostname DNS on a custom network does not work \
+                              (apple/container#1809)"
+                        .to_owned(),
+                },
+                None,
             ));
         }
     }
@@ -446,6 +516,9 @@ fn volume_drift(
 fn plan_orphans(stack: &ResolvedStack, observed: &Observed, warnings: &mut Vec<Step>) {
     for container in &observed.containers {
         if container.project() != Some(stack.name.as_str()) {
+            continue;
+        }
+        if container.label(labels::RUN).is_some() {
             continue;
         }
         match container.service() {

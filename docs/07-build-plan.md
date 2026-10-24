@@ -1,14 +1,14 @@
 # 07 — Build plan
 
-Status: **M0, M1, M2, M3 and M4 complete, 2026-10-24.** The runtime probe is
-done; the stack model, parser, validator, resolver, hash and `config` command are
-built; the runtime adapter, the fake runtime, `plan`, `up` (foreground and `-d`),
-`down`, `ps`, `logs`, the supervisor, healthchecks and the health cache are built.
-The remaining verbs (`exec`, `run`, `build`, `pull`) and isolated networks are
-next. This document records what the runtime actually does, the design changes
-that follow, and the order the build goes in. It supersedes the corresponding
-rows of `01`–`05` where they disagree; the deltas are listed first so they are
-not missed.
+Status: **M0–M5 complete, 2026-10-24.** The runtime probe is done; the stack
+model, parser, validator, resolver, hash and `config` command are built; the
+runtime adapter, the fake runtime, `plan`, `up` (foreground and `-d`), `down`,
+`ps`, `logs`, `exec`, `run`, `build`, `pull`, the supervisor, healthchecks, the
+health cache and isolated networks are built. 152 tests pass, plus one ignored
+real-runtime smoke test. This document records what the runtime actually does,
+the design changes that follow, and the order the build goes in. It supersedes
+the corresponding rows of `01`–`05` where they disagree; the deltas are listed
+first so they are not missed.
 
 The probe used `container` 1.6.0 (Homebrew) on macOS 27.0.1, arm64, with the
 recommended kernel installed. Every JSON fragment below is copied from a real
@@ -506,6 +506,37 @@ and left the container stopped for `down`.
 
 `exec`, `run`, `build`, `pull`, `isolated` networks with the DNS caveat,
 drift reporting, `ps --probe`, the real-runtime smoke test.
+
+**Done.** The last four verbs are in the CLI. `exec` and `run` inherit the
+terminal, choose `-i`/`-t` from `-i`/`-t`/`-T` and whether stdin is a TTY, and
+propagate the child's exit code (a failed `exec` no longer collapses to 1).
+`run` creates `<project>-<service>-run`, carries the `dev.container-compose.run`
+label, is removed on exit unless `--keep`, is hidden by `ps` once stopped, and is
+ignored by `down` and the plan. `build` passes `--no-cache` and prints the argv
+with `--dry-run`; `pull` skips `pull = "never"` and locally built services.
+
+Isolated networks are reconciled like any other resource: created with the
+project label, kept when the subnet matches, refused when a network we own has a
+different subnet or a foreign network has one that does not match; `up` prints
+the apple/container#1809 caveat once, and `down` deletes the project network
+after the containers. Volume size/journal drift and network subnet drift are
+refusals, not silent changes. `ps --probe` runs each healthcheck now and reports
+`source: "probe"`.
+
+One delta the design did not anticipate: `run` of a service that mounts a named
+volume is refused (exit 3) while that service runs, because the runtime allows a
+named volume one running holder (D2). `exec` is the documented way in.
+
+The real-runtime smoke test is `crates/cli/tests/smoke.rs`, `#[ignore]`d:
+
+```sh
+cargo test -p container-compose-cli --test smoke -- --ignored --nocapture
+```
+
+It created an isolated network, a volume and two containers, waited for
+readiness, ran `ps --probe`, `exec`, `run` and `logs`, then `down --volumes`, and
+asserted all three resources were gone. It passed in 34.8 s, and the machine was
+left with no containers, no volumes, and only the `default` network.
 
 ## Open questions
 

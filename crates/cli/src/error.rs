@@ -25,6 +25,8 @@ pub enum Error {
     Readiness(String),
     /// The second interrupt skipped the graceful stop.
     Interrupted,
+    /// An `exec` or `run` child exited non-zero; its code is the command's.
+    Child(i32),
     /// Something that should not happen, such as rendering a document. Exit 1.
     Internal(String),
     /// `container` is missing, its output cannot be parsed, or the apiserver is down.
@@ -40,6 +42,9 @@ impl Error {
             Error::Runtime(_) => 1,
             Error::Readiness(_) => 4,
             Error::Interrupted => 130,
+            Error::Child(code) => u8::try_from(*code)
+                .map(|code| if code == 0 { 1 } else { code })
+                .unwrap_or(1),
             Error::Internal(_) => 1,
             Error::Unavailable(_) => 5,
         }
@@ -65,6 +70,7 @@ impl fmt::Display for Error {
             Error::Runtime(message) => write!(f, "{message}"),
             Error::Readiness(message) => write!(f, "{message}"),
             Error::Interrupted => f.write_str("interrupted twice; containers were killed"),
+            Error::Child(code) => write!(f, "child exited with {code}"),
             Error::Unavailable(message) => write!(f, "{message}"),
         }
     }

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use container_compose_runtime::{
-    ContainerConfiguration, ContainerImage, ContainerStatus, Observed, ObservedContainer,
+    labels, ContainerConfiguration, ContainerImage, ContainerStatus, Observed, ObservedContainer,
 };
 use container_compose_supervisor::cache::{write_at, CachedHealth, HealthCache};
 
@@ -1262,4 +1262,365 @@ fn no_stop_on_exit_leaves_containers_running() {
                 .is_some_and(|container| container.is_running()),
         "the first interrupt was asked to leave them"
     );
+}
+
+const ISOLATED: &str = r#"version = 1
+name = "iso"
+[network]
+mode = "isolated"
+[services.api]
+image = "docker.io/library/alpine:latest"
+command = ["sleep", "120"]
+"#;
+
+#[test]
+fn an_isolated_network_is_created_and_removed_by_down() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, ISOLATED);
+    let path = path.to_str().expect("utf-8").to_owned();
+
+    let up = fake
+        .command(&["-f", &path, "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+    assert!(
+        stderr(&up).contains("apple/container#1809"),
+        "the DNS caveat is printed once: {}",
+        stderr(&up)
+    );
+    let world = fake.observed();
+    assert!(world
+        .networks
+        .iter()
+        .any(|network| network.id == "iso-net" && network.project() == Some("iso")));
+
+    let down = fake.command(&["-f", &path, "down"]).output().expect("runs");
+    assert!(down.status.success(), "stderr: {}", stderr(&down));
+    assert!(!fake
+        .observed()
+        .networks
+        .iter()
+        .any(|network| network.id == "iso-net"));
+
+    let calls = mutating(&fake.calls());
+    assert!(
+        calls
+            .iter()
+            .any(|argv| argv.first().map(String::as_str) == Some("network")
+                && argv.get(1).map(String::as_str) == Some("create")),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|argv| argv.first().map(String::as_str) == Some("network")
+                && argv.get(1).map(String::as_str) == Some("delete")),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn exec_runs_in_a_running_service_and_refuses_a_stopped_one() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+    let path = path.to_str().expect("utf-8").to_owned();
+
+    // `a` is selected; `b` is planned and created, but never started.
+    let up = fake
+        .command(&["-f", &path, "up", "-d", "a"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+
+    let stopped = fake
+        .command(&["-f", &path, "exec", "b", "--", "true"])
+        .output()
+        .expect("runs");
+    assert_eq!(
+        stopped.status.code(),
+        Some(1),
+        "stderr: {}",
+        stderr(&stopped)
+    );
+    assert!(
+        stderr(&stopped).contains("is not running"),
+        "{}",
+        stderr(&stopped)
+    );
+
+    let output = fake
+        .command(&["-f", &path, "exec", "-i", "a", "--", "sh", "-c", "echo hi"])
+        .output()
+        .expect("runs");
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let call = fake
+        .calls()
+        .into_iter()
+        .find(|call| call.argv.first().map(String::as_str) == Some("exec"))
+        .expect("an exec call");
+    assert_eq!(call.argv, ["exec", "-i", "two-a", "sh", "-c", "echo hi"]);
+
+    let unknown = fake
+        .command(&["-f", &path, "exec", "nope", "--", "true"])
+        .output()
+        .expect("runs");
+    assert_eq!(unknown.status.code(), Some(2));
+}
+
+#[test]
+fn run_is_one_off_and_keep_persists_it() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+    let path = path.to_str().expect("utf-8").to_owned();
+    let up = fake
+        .command(&["-f", &path, "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+
+    let one_off = fake
+        .command(&["-f", &path, "run", "a", "--", "echo", "hi"])
+        .output()
+        .expect("runs");
+    assert!(one_off.status.success(), "stderr: {}", stderr(&one_off));
+    let call = fake
+        .calls()
+        .into_iter()
+        .find(|call| call.argv.first().map(String::as_str) == Some("run"))
+        .expect("a run call");
+    assert!(call.argv.contains(&"--rm".to_owned()), "{:?}", call.argv);
+    assert!(
+        call.argv
+            .windows(2)
+            .any(|pair| pair == ["--name", "two-a-run"]),
+        "{:?}",
+        call.argv
+    );
+    assert!(
+        call.argv
+            .windows(2)
+            .any(|pair| pair == ["--label", "dev.container-compose.run=1"]),
+        "{:?}",
+        call.argv
+    );
+    assert!(
+        call.argv.ends_with(&["echo".to_owned(), "hi".to_owned()]),
+        "the command replaces the service's: {:?}",
+        call.argv
+    );
+    assert!(fake.container("two-a-run").is_none(), "--rm removes it");
+
+    let kept = fake
+        .command(&["-f", &path, "run", "--keep", "a", "--", "sh"])
+        .output()
+        .expect("runs");
+    assert!(kept.status.success(), "stderr: {}", stderr(&kept));
+    let container = fake
+        .container("two-a-run")
+        .expect("the kept container remains");
+    assert_eq!(container.label(labels::RUN), Some("1"));
+
+    // A stopped run container is not part of `ps`.
+    let listed = fake
+        .command(&["-f", &path, "ps", "--json"])
+        .output()
+        .expect("runs");
+    let entries: Vec<PsDoc> = serde_json::from_slice(&listed.stdout).expect("typed records");
+    assert!(
+        entries.iter().all(|entry| entry.name != "two-a-run"),
+        "{entries:?}"
+    );
+
+    let again = fake
+        .command(&["-f", &path, "run", "--keep", "a", "--", "sh"])
+        .output()
+        .expect("runs");
+    assert_eq!(again.status.code(), Some(3), "stderr: {}", stderr(&again));
+}
+
+#[test]
+fn build_and_pull_cover_the_right_services() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let project = dir.path().join("project");
+    fs::create_dir(&project).expect("create project dir");
+    fs::write(project.join("Containerfile"), "FROM scratch\n").expect("write the Containerfile");
+    fs::write(
+        project.join("stack.toml"),
+        r#"version = 1
+name = "img"
+[services.built]
+[services.built.build]
+context = "."
+containerfile = "Containerfile"
+[services.pulled]
+image = "docker.io/library/alpine:latest"
+[services.never]
+image = "docker.io/library/alpine:latest"
+pull = "never"
+"#,
+    )
+    .expect("write the stack");
+    let path = project.join("stack.toml");
+    let path = path.to_str().expect("utf-8").to_owned();
+
+    let dry = fake
+        .command(&["-f", &path, "build", "--dry-run"])
+        .output()
+        .expect("runs");
+    assert!(dry.status.success(), "stderr: {}", stderr(&dry));
+    assert!(
+        stdout(&dry).contains("container build -t img-built:local"),
+        "{}",
+        stdout(&dry)
+    );
+    assert!(fake.calls().is_empty(), "a dry run executes nothing");
+
+    let build = fake
+        .command(&["-f", &path, "build"])
+        .output()
+        .expect("runs");
+    assert!(build.status.success(), "stderr: {}", stderr(&build));
+    let call = fake
+        .calls()
+        .into_iter()
+        .find(|call| call.argv.first().map(String::as_str) == Some("build"))
+        .expect("a build call");
+    assert!(call
+        .argv
+        .windows(2)
+        .any(|pair| pair == ["-t", "img-built:local"]));
+
+    fake.reset_calls();
+    let pull = fake.command(&["-f", &path, "pull"]).output().expect("runs");
+    assert!(pull.status.success(), "stderr: {}", stderr(&pull));
+    assert!(stdout(&pull).contains("built locally"), "{}", stdout(&pull));
+    assert!(
+        stdout(&pull).contains("pull = \"never\""),
+        "{}",
+        stdout(&pull)
+    );
+    let pulls = mutating(&fake.calls());
+    assert_eq!(
+        pulls,
+        vec![vec![
+            "image".to_owned(),
+            "pull".to_owned(),
+            "docker.io/library/alpine:latest".to_owned()
+        ]]
+    );
+}
+
+#[test]
+fn ps_probe_runs_the_healthcheck_now() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, gated_stack());
+    let path = path.to_str().expect("utf-8").to_owned();
+    let up = fake
+        .command(&["-f", &path, "up", "-d", "--wait"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+
+    let healthy = fake
+        .command(&["-f", &path, "ps", "--probe", "--json"])
+        .output()
+        .expect("runs");
+    let entries: Vec<PsDoc> = serde_json::from_slice(&healthy.stdout).expect("typed records");
+    let a = entries
+        .iter()
+        .find(|entry| entry.name == "gate-a")
+        .expect("gate-a");
+    assert_eq!(a.health.state, "healthy");
+    assert_eq!(a.health.source, "probe");
+
+    fake.inject(&Injection {
+        subcommand: "exec",
+        needle: Some("gate-a"),
+        exit: 1,
+        stderr: "Error: probe failed",
+    });
+    let unhealthy = fake
+        .command(&["-f", &path, "ps", "--probe", "--json"])
+        .output()
+        .expect("runs");
+    let entries: Vec<PsDoc> = serde_json::from_slice(&unhealthy.stdout).expect("typed records");
+    let a = entries
+        .iter()
+        .find(|entry| entry.name == "gate-a")
+        .expect("gate-a");
+    assert_eq!(a.health.state, "unhealthy");
+}
+
+#[test]
+fn ps_probe_without_a_stack_file_is_a_usage_error() {
+    let fake = Fake::new();
+    let output = fake
+        .command(&["-f", "missing.toml", "ps", "--probe"])
+        .output()
+        .expect("runs");
+    assert_eq!(output.status.code(), Some(2), "stderr: {}", stderr(&output));
+}
+
+#[test]
+fn down_leaves_a_kept_run_container_alone() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+    let path = path.to_str().expect("utf-8").to_owned();
+    let up = fake
+        .command(&["-f", &path, "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success());
+    let run = fake
+        .command(&["-f", &path, "run", "--keep", "a", "--", "sh"])
+        .output()
+        .expect("runs");
+    assert!(run.status.success(), "stderr: {}", stderr(&run));
+
+    let down = fake.command(&["-f", &path, "down"]).output().expect("runs");
+    assert!(down.status.success(), "stderr: {}", stderr(&down));
+    assert!(fake.container("two-a").is_none());
+    assert!(fake.container("two-b").is_none());
+    assert!(
+        fake.container("two-a-run").is_some(),
+        "`down` does not know about a one-off run container"
+    );
+}
+
+#[test]
+fn run_refuses_a_service_holding_a_named_volume() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(
+        &dir,
+        r#"version = 1
+name = "vols"
+[volumes.data]
+size = "1G"
+[services.api]
+image = "docker.io/library/alpine:latest"
+command = ["sleep", "120"]
+volumes = ["data:/data"]
+"#,
+    );
+    let path = path.to_str().expect("utf-8").to_owned();
+    let up = fake
+        .command(&["-f", &path, "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+
+    let run = fake
+        .command(&["-f", &path, "run", "api", "--", "true"])
+        .output()
+        .expect("runs");
+    assert_eq!(run.status.code(), Some(3), "stderr: {}", stderr(&run));
+    assert!(stderr(&run).contains("named volume"), "{}", stderr(&run));
 }

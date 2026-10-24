@@ -86,6 +86,26 @@ impl Command {
         self.finish(self.output_of(output))
     }
 
+    /// Run with stdin, stdout and stderr inherited, for `exec` and `run`.
+    /// A non-zero exit is the child's answer, not a failure to run it.
+    pub fn status(&self) -> Result<i32, RuntimeError> {
+        let status = std::process::Command::new(&self.program)
+            .args(&self.args)
+            .envs(&self.envs)
+            .status()
+            .map_err(|error| self.spawn_error(error))?;
+        let code = status.code().unwrap_or(-1);
+        if status.success() {
+            Ok(code)
+        } else {
+            Err(RuntimeError {
+                argv: self.full_argv(),
+                status: Some(code),
+                stderr: String::new(),
+            })
+        }
+    }
+
     /// Run with a deadline. Health probes use this: the runtime offers no
     /// timeout of its own, and a hung `exec` must not hang the supervisor.
     pub fn run_with_timeout(&self, timeout: Duration) -> Result<Completion, RuntimeError> {

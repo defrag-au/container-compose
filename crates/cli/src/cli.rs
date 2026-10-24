@@ -4,6 +4,7 @@
 //! are implemented. The foreground `up` is the supervisor.
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -12,14 +13,19 @@ use serde::Serialize;
 
 use container_compose_plan::apply::{self, DownOptions, UpOptions};
 use container_compose_plan::{plan as build_plan, plan_with, Detail, Plan, PlanOptions, Refusal};
-use container_compose_runtime::{argv, observe, Command as RuntimeCommand, ObservedContainer};
+use container_compose_runtime::{
+    argv, labels, observe, probe, Command as RuntimeCommand, ObservedContainer, Probe,
+};
 use container_compose_stack::duration::Span;
 use container_compose_stack::env::{self, Guard};
-use container_compose_stack::model::RestartPolicy;
+use container_compose_stack::model::{PullPolicy, RestartPolicy};
 use container_compose_stack::ports::Protocol;
-use container_compose_stack::resolve::{MountSource, ResolvedService, ResolvedStack};
+use container_compose_stack::resolve::{
+    MountSource, ResolvedHealthcheck, ResolvedService, ResolvedStack,
+};
 use container_compose_stack::{self as stack, Options};
 use container_compose_supervisor::cache;
+use container_compose_supervisor::clock;
 use container_compose_supervisor::lock::{self, LockError};
 use container_compose_supervisor::{
     run as supervise, Options as SupervisorOptions, SupervisorError,
@@ -122,6 +128,61 @@ pub enum Command {
         /// Emit the machine-readable document.
         #[arg(long)]
         json: bool,
+        /// Run each healthcheck now instead of reading the supervisor's cache.
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Run a command in a running service.
+    Exec {
+        service: String,
+        /// Keep stdin open.
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Allocate a TTY.
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Disable stdin and the TTY.
+        #[arg(short = 'T', long = "no-tty")]
+        no_tty: bool,
+        /// The command, after `--`.
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+    /// Run a one-off container with a service's configuration.
+    Run {
+        service: String,
+        /// Keep the container when it exits.
+        #[arg(long)]
+        keep: bool,
+        /// Keep stdin open.
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Allocate a TTY.
+        #[arg(short = 't', long)]
+        tty: bool,
+        /// Disable stdin and the TTY.
+        #[arg(short = 'T', long = "no-tty")]
+        no_tty: bool,
+        /// A command that replaces the service's, after `--`.
+        #[arg(last = true, num_args = 0..)]
+        command: Vec<String>,
+    },
+    /// Build the images of services with a build table.
+    Build {
+        services: Vec<String>,
+        /// Do not use the build cache.
+        #[arg(long)]
+        no_cache: bool,
+        /// Print the argv without running it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Pull the services' images.
+    Pull {
+        services: Vec<String>,
+        /// Print the argv without running it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Print a service's logs.
     Logs {
@@ -167,12 +228,33 @@ pub fn run(cli: Cli) -> Result<(), Error> {
             timeout,
             dry_run,
         } => down_command(&cli, *volumes, *timeout, *dry_run),
-        Command::Ps { json } => ps_command(&cli, *json),
+        Command::Ps { json, probe } => ps_command(&cli, *json, *probe),
         Command::Logs {
             services,
             follow,
             lines,
         } => logs_command(&cli, services, *follow, *lines),
+        Command::Exec {
+            service,
+            interactive,
+            tty,
+            no_tty,
+            command,
+        } => exec_command(&cli, service, *interactive, *tty, *no_tty, command),
+        Command::Run {
+            service,
+            keep,
+            interactive,
+            tty,
+            no_tty,
+            command,
+        } => run_command(&cli, service, *keep, *interactive, *tty, *no_tty, command),
+        Command::Build {
+            services,
+            no_cache,
+            dry_run,
+        } => build_command(&cli, services, *no_cache, *dry_run),
+        Command::Pull { services, dry_run } => pull_command(&cli, services, *dry_run),
     }
 }
 
@@ -353,9 +435,7 @@ fn down_command(cli: &Cli, volumes: bool, timeout: Span, dry_run: bool) -> Resul
     Ok(())
 }
 
-fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
-    let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
-
+fn ps_command(cli: &Cli, json: bool, probe_now: bool) -> Result<(), Error> {
     // `ps` is the one command that works without the stack file: an interrupted
     // session must stay inspectable. A file that exists but does not load is
     // still an error.
@@ -369,6 +449,13 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
     } else {
         None
     };
+    if probe_now && stack.is_none() {
+        return Err(Error::Usage(
+            "`ps --probe` needs the stack file for the healthchecks".to_owned(),
+        ));
+    }
+
+    let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
     let project = stack
         .as_ref()
         .map(|stack| stack.name.clone())
@@ -385,6 +472,9 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
         .containers
         .iter()
         .filter(|container| container.project() == Some(project.as_str()))
+        // A kept one-off `run` container is not part of the stack; show it only
+        // while it is alive.
+        .filter(|container| container.label(labels::RUN).is_none() || container.is_running())
         .collect();
     containers.sort_by_key(|container| {
         ps_rank(
@@ -397,36 +487,33 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
     let entries: Vec<PsEntry> = containers
         .into_iter()
         .map(|container| {
-            let ports = stack
-                .as_ref()
-                .and_then(|stack| {
-                    container
-                        .service()
-                        .and_then(|name| stack.services.get(name))
-                })
-                .map(render_ports)
-                .unwrap_or_default();
-            let cached = if container.is_running() {
-                health_cache.as_ref().and_then(|cache| {
-                    container
-                        .service()
-                        .and_then(|name| cache.services.get(name))
-                })
+            let service = stack.as_ref().and_then(|stack| {
+                container
+                    .service()
+                    .and_then(|name| stack.services.get(name))
+            });
+            let ports = service.map(render_ports).unwrap_or_default();
+            let health = if probe_now && container.is_running() {
+                match service.and_then(|service| service.healthcheck.as_ref()) {
+                    Some(check) => probe_health(&cli.runtime, &container.id, check),
+                    None => unknown_health(),
+                }
+            } else if container.is_running() {
+                health_cache
+                    .as_ref()
+                    .and_then(|cache| {
+                        container
+                            .service()
+                            .and_then(|name| cache.services.get(name))
+                    })
+                    .map_or_else(unknown_health, |cached| PsHealth {
+                        state: cached.state.clone(),
+                        checked_at: cached.checked_at.clone(),
+                        source: "supervisor".to_owned(),
+                    })
             } else {
-                None
+                unknown_health()
             };
-            let health = cached.map_or_else(
-                || PsHealth {
-                    state: "unknown".to_owned(),
-                    checked_at: None,
-                    source: "none".to_owned(),
-                },
-                |cached| PsHealth {
-                    state: cached.state.clone(),
-                    checked_at: cached.checked_at.clone(),
-                    source: "supervisor".to_owned(),
-                },
-            );
             PsEntry {
                 name: container.id.clone(),
                 service: container.service().map(str::to_owned),
@@ -449,6 +536,268 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
         println!();
     }
     Ok(())
+}
+
+struct TerminalFlags {
+    interactive: bool,
+    tty: bool,
+}
+
+/// `-T` disables both; otherwise a TTY is allocated when stdin is one, and
+/// `-i`/`-t` can ask for either explicitly.
+fn terminal_flags(interactive: bool, tty: bool, no_tty: bool) -> TerminalFlags {
+    if no_tty {
+        return TerminalFlags {
+            interactive: false,
+            tty: false,
+        };
+    }
+    let stdin_tty = std::io::stdin().is_terminal();
+    let tty = tty || stdin_tty;
+    TerminalFlags {
+        interactive: interactive || tty || stdin_tty,
+        tty,
+    }
+}
+
+fn run_attached(command: RuntimeCommand) -> Result<(), Error> {
+    match command.status() {
+        Ok(_) => Ok(()),
+        Err(error) => match error.status {
+            Some(code) => Err(Error::Child(code)),
+            None => Err(Error::Runtime(error.to_string())),
+        },
+    }
+}
+
+fn exec_command(
+    cli: &Cli,
+    service_name: &str,
+    interactive: bool,
+    tty: bool,
+    no_tty: bool,
+    command: &[String],
+) -> Result<(), Error> {
+    let stack = stack::load(
+        &cli.file,
+        &Options {
+            project_name: cli.project_name.clone(),
+        },
+    )?;
+    let service = stack.services.get(service_name).ok_or_else(|| {
+        Error::Usage(format!(
+            "no service named `{service_name}`; the stack has {}",
+            stack.order.join(", ")
+        ))
+    })?;
+    let container = argv::container_name(&stack.name, &service.name);
+
+    let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
+    match observed.container(&container) {
+        Some(found) if found.is_running() => {}
+        Some(_) => {
+            return Err(Error::Runtime(format!(
+                "`{container}` is not running; `exec` does not start it"
+            )))
+        }
+        None => {
+            return Err(Error::Runtime(format!(
+                "`{container}` does not exist; run `container-compose up -d`"
+            )))
+        }
+    }
+
+    let flags = terminal_flags(interactive, tty, no_tty);
+    let exec_argv = argv::exec_attached(&container, command, flags.interactive, flags.tty);
+    run_attached(RuntimeCommand::new(&cli.runtime).args(exec_argv))
+}
+
+fn run_command(
+    cli: &Cli,
+    service_name: &str,
+    keep: bool,
+    interactive: bool,
+    tty: bool,
+    no_tty: bool,
+    command: &[String],
+) -> Result<(), Error> {
+    let stack = load_checked(cli, true)?;
+    let service = stack.services.get(service_name).ok_or_else(|| {
+        Error::Usage(format!(
+            "no service named `{service_name}`; the stack has {}",
+            stack.order.join(", ")
+        ))
+    })?;
+    let run_name = argv::run_name(&stack.name, &service.name);
+
+    let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
+    if observed.container(&run_name).is_some() {
+        return Err(Error::Refused(vec![Refusal {
+            path: "run".to_owned(),
+            message: format!(
+                "`{run_name}` already exists; remove it with `container delete {run_name}`"
+            ),
+        }]));
+    }
+
+    // A named volume can only be held by one running container. The service's
+    // own container is that holder whenever it is up.
+    let service_container = argv::container_name(&stack.name, &service.name);
+    let holds_volume = service
+        .volumes
+        .iter()
+        .any(|mount| matches!(mount.source, MountSource::Volume { .. }));
+    if holds_volume
+        && observed
+            .container(&service_container)
+            .is_some_and(|container| container.is_running())
+    {
+        return Err(Error::Refused(vec![Refusal {
+            path: "run".to_owned(),
+            message: format!(
+                "`{service_name}` mounts a named volume, which its running container holds; \
+                 stop it first or use `exec` in the running container"
+            ),
+        }]));
+    }
+
+    let flags = terminal_flags(interactive, tty, no_tty);
+    let command = if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    };
+    let run_argv = argv::run_container(
+        &stack,
+        service,
+        command,
+        flags.interactive,
+        flags.tty,
+        !keep,
+    );
+    run_attached(
+        RuntimeCommand::new(&cli.runtime)
+            .args(run_argv)
+            .envs(service.env.clone()),
+    )
+}
+
+fn selected_services(stack: &ResolvedStack, requested: &[String]) -> Result<Vec<String>, Error> {
+    if requested.is_empty() {
+        return Ok(stack.order.clone());
+    }
+    for name in requested {
+        if !stack.services.contains_key(name) {
+            return Err(Error::Usage(format!("no service named `{name}`")));
+        }
+    }
+    Ok(stack
+        .order
+        .iter()
+        .filter(|name| requested.contains(name))
+        .cloned()
+        .collect())
+}
+
+fn build_command(
+    cli: &Cli,
+    services: &[String],
+    no_cache: bool,
+    dry_run: bool,
+) -> Result<(), Error> {
+    let stack = stack::load(
+        &cli.file,
+        &Options {
+            project_name: cli.project_name.clone(),
+        },
+    )?;
+    let selected = selected_services(&stack, services)?;
+
+    let mut built = 0;
+    for name in selected {
+        let service = &stack.services[&name];
+        let Some(build) = &service.build else {
+            println!("skip     {name}  no build table");
+            continue;
+        };
+        let build_argv = argv::build_image(&service.image, build, no_cache);
+        if dry_run {
+            println!("container {}", build_argv.join(" "));
+            continue;
+        }
+        println!("building {}", service.image);
+        RuntimeCommand::new(&cli.runtime)
+            .args(build_argv)
+            .run()
+            .map_err(|error| Error::Runtime(error.to_string()))?;
+        built += 1;
+    }
+    if !dry_run {
+        println!("built {built} image{}", if built == 1 { "" } else { "s" });
+    }
+    Ok(())
+}
+
+fn pull_command(cli: &Cli, services: &[String], dry_run: bool) -> Result<(), Error> {
+    let stack = stack::load(
+        &cli.file,
+        &Options {
+            project_name: cli.project_name.clone(),
+        },
+    )?;
+    let selected = selected_services(&stack, services)?;
+
+    for name in selected {
+        let service = &stack.services[&name];
+        if service.build.is_some() {
+            println!("skip     {name}  built locally");
+            continue;
+        }
+        if service.pull == PullPolicy::Never {
+            println!("skip     {name}  pull = \"never\"");
+            continue;
+        }
+        let pull_argv = argv::pull_image(&service.image);
+        if dry_run {
+            println!("container {}", pull_argv.join(" "));
+            continue;
+        }
+        println!("pulling  {}", service.image);
+        RuntimeCommand::new(&cli.runtime)
+            .args(pull_argv)
+            .run()
+            .map_err(|error| Error::Runtime(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn probe_health(runtime: &str, container: &str, check: &ResolvedHealthcheck) -> PsHealth {
+    let state = match probe::probe(runtime, container, &check.exec, check.timeout.as_duration()) {
+        Ok(Probe::Healthy) => "healthy",
+        Ok(Probe::Failed { .. }) => "unhealthy",
+        Ok(Probe::Unknown { .. }) => "unknown",
+        Ok(Probe::MissingBinary { binary, .. }) => {
+            eprintln!("warning: {container}: probe binary `{binary}` does not exist");
+            "unhealthy"
+        }
+        Err(error) => {
+            eprintln!("warning: cannot probe {container}: {error}");
+            "unknown"
+        }
+    };
+    PsHealth {
+        state: state.to_owned(),
+        checked_at: Some(clock::format_rfc3339_seconds(clock::wall_ms() / 1_000)),
+        source: "probe".to_owned(),
+    }
+}
+
+fn unknown_health() -> PsHealth {
+    PsHealth {
+        state: "unknown".to_owned(),
+        checked_at: None,
+        source: "none".to_owned(),
+    }
 }
 
 fn logs_command(cli: &Cli, services: &[String], follow: bool, lines: u32) -> Result<(), Error> {

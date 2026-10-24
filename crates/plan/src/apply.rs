@@ -11,9 +11,10 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use container_compose_runtime::{
-    argv, observe, probe, Command, Observed, ObservedContainer, ObservedVolume, Probe, RuntimeError,
+    argv, labels, observe, probe, Command, Observed, ObservedContainer, ObservedVolume, Probe,
+    RuntimeError,
 };
-use container_compose_stack::model::Condition;
+use container_compose_stack::model::{Condition, NetworkMode};
 use container_compose_stack::resolve::{ResolvedService, ResolvedStack};
 
 use crate::{Action, Detail, Plan, Resource, Step};
@@ -274,6 +275,8 @@ pub fn down(
         .containers
         .iter()
         .filter(|container| container.project() == Some(stack.name.as_str()))
+        // A one-off `run` container is not part of the stack.
+        .filter(|container| container.label(labels::RUN).is_none())
         .collect();
     containers.sort_by_key(|container| teardown_rank(stack, container.service()));
 
@@ -287,7 +290,15 @@ pub fn down(
         Vec::new()
     };
 
-    if containers.is_empty() && volumes.is_empty() {
+    let network = if stack.network.mode == NetworkMode::Isolated {
+        observed
+            .network(&stack.network.name)
+            .filter(|network| network.project() == Some(stack.name.as_str()))
+    } else {
+        None
+    };
+
+    if containers.is_empty() && volumes.is_empty() && network.is_none() {
         writeln!(out, "stack {} has nothing to remove", stack.name)?;
         return Ok(());
     }
@@ -346,6 +357,23 @@ pub fn down(
                 format!("deleting volume {}", volume.id),
             )?;
             writeln!(out, "deleted  volume {}", volume.id)?;
+        }
+    }
+
+    if let Some(network) = network {
+        let delete = argv::delete_network(&network.id);
+        if options.dry_run {
+            writeln!(out, "delete   network {}", network.id)?;
+        } else {
+            run(
+                out,
+                &options.runtime,
+                &delete,
+                BTreeMap::new(),
+                options.verbose,
+                format!("deleting network {}", network.id),
+            )?;
+            writeln!(out, "deleted  network {}", network.id)?;
         }
     }
 

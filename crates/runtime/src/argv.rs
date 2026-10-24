@@ -15,18 +15,75 @@ pub fn container_name(project: &str, service: &str) -> String {
 }
 
 pub fn create_container(stack: &ResolvedStack, service: &ResolvedService) -> Vec<String> {
-    let mut args = vec![
-        "create".to_owned(),
-        "--name".to_owned(),
-        container_name(&stack.name, &service.name),
-    ];
+    let mut args = vec!["create".to_owned()];
+    args.extend(container_flags(
+        stack,
+        service,
+        &container_name(&stack.name, &service.name),
+        false,
+    ));
+    args.push(service.image.clone());
+    if let Some(command) = &service.command {
+        args.extend(command.iter().cloned());
+    }
+    args
+}
 
-    for (key, value) in [
+/// A one-off container for `run`: the service's configuration, a distinct
+/// name, attached to the terminal, and `--rm` unless the caller wants to keep
+/// it. `command` replaces the service's command when given.
+pub fn run_container(
+    stack: &ResolvedStack,
+    service: &ResolvedService,
+    command: Option<&[String]>,
+    interactive: bool,
+    tty: bool,
+    remove: bool,
+) -> Vec<String> {
+    let mut args = vec!["run".to_owned()];
+    if interactive {
+        args.push("-i".to_owned());
+    }
+    if tty {
+        args.push("-t".to_owned());
+    }
+    if remove {
+        args.push("--rm".to_owned());
+    }
+    args.extend(container_flags(
+        stack,
+        service,
+        &run_name(&stack.name, &service.name),
+        true,
+    ));
+    args.push(service.image.clone());
+    let command = command.or(service.command.as_deref());
+    if let Some(command) = command {
+        args.extend(command.iter().cloned());
+    }
+    args
+}
+
+/// Everything between the subcommand and the image: name, labels, network,
+/// env, mounts, ports, resources and process options.
+fn container_flags(
+    stack: &ResolvedStack,
+    service: &ResolvedService,
+    name: &str,
+    run: bool,
+) -> Vec<String> {
+    let mut args = vec!["--name".to_owned(), name.to_owned()];
+
+    let mut labels = vec![
         (labels::PROJECT, stack.name.as_str()),
         (labels::SERVICE, service.name.as_str()),
         (labels::CONFIG, service.config_hash.as_str()),
         (labels::SCHEMA, labels::SCHEMA_VERSION),
-    ] {
+    ];
+    if run {
+        labels.push((labels::RUN, "1"));
+    }
+    for (key, value) in labels {
         args.push("--label".to_owned());
         args.push(format!("{key}={value}"));
     }
@@ -98,11 +155,11 @@ pub fn create_container(stack: &ResolvedStack, service: &ResolvedService) -> Vec
         args.push(entrypoint.clone());
     }
 
-    args.push(service.image.clone());
-    if let Some(command) = &service.command {
-        args.extend(command.iter().cloned());
-    }
     args
+}
+
+pub fn run_name(project: &str, service: &str) -> String {
+    format!("{project}-{service}-run")
 }
 
 pub fn start_container(name: &str) -> Vec<String> {
@@ -186,7 +243,7 @@ pub fn pull_image(reference: &str) -> Vec<String> {
     vec!["image".to_owned(), "pull".to_owned(), reference.to_owned()]
 }
 
-pub fn build_image(image: &str, build: &ResolvedBuild) -> Vec<String> {
+pub fn build_image(image: &str, build: &ResolvedBuild, no_cache: bool) -> Vec<String> {
     let mut args = vec![
         "build".to_owned(),
         "-t".to_owned(),
@@ -194,6 +251,9 @@ pub fn build_image(image: &str, build: &ResolvedBuild) -> Vec<String> {
         "-f".to_owned(),
         build.containerfile.display().to_string(),
     ];
+    if no_cache {
+        args.push("--no-cache".to_owned());
+    }
     if let Some(target) = &build.target {
         args.push("--target".to_owned());
         args.push(target.clone());
@@ -221,6 +281,20 @@ pub fn logs(name: &str, follow: bool, lines: Option<u32>) -> Vec<String> {
 
 pub fn exec(name: &str, command: &[String]) -> Vec<String> {
     let mut args = vec!["exec".to_owned(), name.to_owned()];
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// `exec` with the terminal flags the CLI chose.
+pub fn exec_attached(name: &str, command: &[String], interactive: bool, tty: bool) -> Vec<String> {
+    let mut args = vec!["exec".to_owned()];
+    if interactive {
+        args.push("-i".to_owned());
+    }
+    if tty {
+        args.push("-t".to_owned());
+    }
+    args.push(name.to_owned());
     args.extend(command.iter().cloned());
     args
 }
