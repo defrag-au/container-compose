@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::BufRead;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct Command {
@@ -19,6 +21,14 @@ pub struct Output {
     pub status: i32,
     pub stdout: String,
     pub stderr: String,
+}
+
+/// How a command that was given a deadline finished.
+#[derive(Debug, Clone)]
+pub enum Completion {
+    Exited(Output),
+    /// The child was killed because it outlived its deadline.
+    TimedOut,
 }
 
 #[derive(Debug, Clone)]
@@ -67,36 +77,109 @@ impl Command {
     }
 
     pub fn run(&self) -> Result<Output, RuntimeError> {
-        let full_argv = std::iter::once(self.program.clone())
-            .chain(self.args.iter().cloned())
-            .collect::<Vec<_>>();
-
         let output = std::process::Command::new(&self.program)
             .args(&self.args)
             .envs(&self.envs)
             .output()
-            .map_err(|error| RuntimeError {
-                argv: full_argv.clone(),
-                status: None,
-                stderr: format!("cannot run `{}`: {error}", self.program),
-            })?;
+            .map_err(|error| self.spawn_error(error))?;
 
+        self.finish(self.output_of(output))
+    }
+
+    /// Run with a deadline. Health probes use this: the runtime offers no
+    /// timeout of its own, and a hung `exec` must not hang the supervisor.
+    pub fn run_with_timeout(&self, timeout: Duration) -> Result<Completion, RuntimeError> {
+        let mut child = std::process::Command::new(&self.program)
+            .args(&self.args)
+            .envs(&self.envs)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| self.spawn_error(error))?;
+
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait().map_err(|error| self.spawn_error(error))? {
+                Some(_) => {
+                    let output = child
+                        .wait_with_output()
+                        .map_err(|error| self.spawn_error(error))?;
+                    return Ok(Completion::Exited(self.output_of(output)));
+                }
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(Completion::TimedOut);
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// Run with stdout delivered line by line, for `logs`. The exit status and
+    /// stderr are returned once the child closes stdout.
+    pub fn stream_lines(&self, on_line: &mut dyn FnMut(&str)) -> Result<Output, RuntimeError> {
+        let mut child = std::process::Command::new(&self.program)
+            .args(&self.args)
+            .envs(&self.envs)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| self.spawn_error(error))?;
+
+        if let Some(stdout) = child.stdout.take() {
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => on_line(&line),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(self.spawn_error(error));
+                    }
+                }
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|error| self.spawn_error(error))?;
+        self.finish(self.output_of(output))
+    }
+
+    fn finish(&self, output: Output) -> Result<Output, RuntimeError> {
+        if output.status == 0 {
+            Ok(output)
+        } else {
+            Err(RuntimeError {
+                argv: self.full_argv(),
+                status: Some(output.status),
+                stderr: output.stderr,
+            })
+        }
+    }
+
+    fn full_argv(&self) -> Vec<String> {
+        std::iter::once(self.program.clone())
+            .chain(self.args.iter().cloned())
+            .collect()
+    }
+
+    fn output_of(&self, output: std::process::Output) -> Output {
         let status = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
 
-        if output.status.success() {
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        } else {
-            Err(RuntimeError {
-                argv: full_argv,
-                status: Some(status),
-                stderr,
-            })
+    fn spawn_error(&self, error: std::io::Error) -> RuntimeError {
+        RuntimeError {
+            argv: self.full_argv(),
+            status: None,
+            stderr: format!("cannot run `{}`: {error}", self.program),
         }
     }
 }

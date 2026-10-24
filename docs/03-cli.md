@@ -137,9 +137,9 @@ With a service list, `up` starts those services **and their dependencies**;
 everything else is planned but not started. A service named in the list that
 does not exist is a usage error (exit 2).
 
-Until the supervisor lands (M4), `up` requires `-d`: foreground `up` *is* the
-supervisor, so without the flag the command refuses with exit 3 instead of
-silently detaching.
+Foreground `up` supervises: it reconciles, waits for readiness, then polls the
+runtime until Ctrl-C. A project has one supervisor at a time; a second `up`
+refuses (exit 3, naming the pid).
 
 Progress goes to stderr, one line per step, so stdout stays clean for `--json`:
 
@@ -173,6 +173,10 @@ container-compose down --dry-run
 stops and deletes only resources carrying the project label. It never uses
 `--all`, `prune`, or `network delete --all`.
 
+While a supervisor holds the project lock, `down` refuses (exit 3, naming the
+pid): stopping containers the supervisor would immediately restart is not a
+teardown. Stop the supervisor first.
+
 `down` exits 0 even when some resource was already absent; a runtime error
 (permission, apiserver down) is exit 1.
 
@@ -204,8 +208,11 @@ recoverable; health then comes from the cache, or is `unknown`.
 ## `logs`
 
 ```sh
-container-compose logs [-f] [-n 200] [SERVICE...]
+container-compose logs [--follow] [-n 200] [SERVICE...]
 ```
+
+Following is `--follow` only: `-f` is the global `--file`, and clap refuses two
+meanings for one short flag.
 
 `logs` is `container logs` per service. With more than one service, every line
 is prefixed with the service name; with one, it is passed through unmodified.

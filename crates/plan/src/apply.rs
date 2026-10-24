@@ -11,8 +11,9 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use container_compose_runtime::{
-    argv, observe, Command, Observed, ObservedContainer, ObservedVolume, RuntimeError,
+    argv, observe, probe, Command, Observed, ObservedContainer, ObservedVolume, Probe, RuntimeError,
 };
+use container_compose_stack::model::Condition;
 use container_compose_stack::resolve::{ResolvedService, ResolvedStack};
 
 use crate::{Action, Detail, Plan, Resource, Step};
@@ -31,6 +32,8 @@ pub struct UpOptions {
     pub timeout: u64,
     /// On failure, leave services this invocation started running.
     pub keep_started: bool,
+    /// Wait for each started service with a healthcheck to become healthy.
+    pub wait: bool,
     /// Echo each `container` argv before running it.
     pub verbose: bool,
 }
@@ -60,6 +63,11 @@ pub enum ApplyError {
         container: String,
         seconds: u64,
     },
+    /// The container runs but its healthcheck did not pass in the budget.
+    Readiness {
+        service: String,
+        message: String,
+    },
     Output(std::io::Error),
 }
 
@@ -67,6 +75,7 @@ impl ApplyError {
     pub fn exit_code(&self) -> u8 {
         match self {
             ApplyError::Usage(_) => 2,
+            ApplyError::Readiness { .. } => 4,
             ApplyError::Runtime { .. }
             | ApplyError::StartTimeout { .. }
             | ApplyError::Output(_) => 1,
@@ -84,6 +93,9 @@ impl fmt::Display for ApplyError {
                 "container `{container}` did not reach `running` within {seconds}s; \
                  run `container-compose logs {container}`"
             ),
+            ApplyError::Readiness { service, message } => {
+                write!(f, "service `{service}` did not become healthy: {message}")
+            }
             ApplyError::Output(error) => write!(f, "cannot write progress: {error}"),
         }
     }
@@ -97,6 +109,13 @@ impl From<std::io::Error> for ApplyError {
     }
 }
 
+/// What a successful `up` selected, so a foreground supervisor knows what to
+/// watch. A named service brings its dependencies.
+#[derive(Debug, Clone)]
+pub struct UpOutcome {
+    pub selected: BTreeSet<String>,
+}
+
 /// Run the plan. Progress goes to `out`; findings stay on stdout.
 ///
 /// The caller refuses a plan with refusals before calling this: nothing here
@@ -106,7 +125,7 @@ pub fn up(
     plan: &Plan,
     options: &UpOptions,
     out: &mut dyn Write,
-) -> Result<(), ApplyError> {
+) -> Result<UpOutcome, ApplyError> {
     debug_assert!(
         plan.refusals.is_empty(),
         "the caller must refuse a plan with refusals before applying it"
@@ -115,7 +134,10 @@ pub fn up(
     let mut started = Vec::new();
 
     if let Err(error) = run_steps(stack, plan, options, &selected, &mut started, out) {
-        if !options.keep_started && !started.is_empty() {
+        if !options.keep_started
+            && !started.is_empty()
+            && !matches!(error, ApplyError::Readiness { .. })
+        {
             writeln!(
                 out,
                 "stopping {} service(s) this run started",
@@ -146,7 +168,7 @@ pub fn up(
         selected.len(),
         if selected.len() == 1 { "" } else { "s" }
     )?;
-    Ok(())
+    Ok(UpOutcome { selected })
 }
 
 fn run_steps(
@@ -180,6 +202,17 @@ fn run_steps(
                 }
 
                 let run_argv = step.argv.as_ref().expect("a start step carries the argv");
+
+                // `service_healthy` gates the start, not the create: the
+                // dependency was started earlier in the order.
+                for dependency in &service.depends_on {
+                    if dependency.condition == Condition::ServiceHealthy {
+                        if let Some(resolved) = stack.services.get(&dependency.service) {
+                            wait_for_healthy(stack, resolved, &options.runtime, out)?;
+                        }
+                    }
+                }
+
                 execute(
                     &options.runtime,
                     run_argv,
@@ -191,6 +224,10 @@ fn run_steps(
                 wait_until_running(&options.runtime, &step.name)?;
                 started.push(step.name.clone());
                 report(out, "running", step)?;
+
+                if options.wait {
+                    wait_for_healthy(stack, service, &options.runtime, out)?;
+                }
             }
             _ => {
                 let run_argv = step
@@ -410,6 +447,74 @@ fn start_failure(step: &Step, service: &ResolvedService, error: RuntimeError) ->
         context.push_str(&format!(" (publishes {ports})"));
     }
     ApplyError::Runtime { context, error }
+}
+
+/// Wait for a service's healthcheck to pass. The budget is the model's:
+/// `start_period + retries × interval`. A missing probe binary can never pass,
+/// so it fails at once with a message naming it.
+fn wait_for_healthy(
+    stack: &ResolvedStack,
+    service: &ResolvedService,
+    runtime: &str,
+    out: &mut dyn Write,
+) -> Result<(), ApplyError> {
+    let Some(check) = &service.healthcheck else {
+        return Ok(());
+    };
+    let container = argv::container_name(&stack.name, &service.name);
+    let budget = check.start_period.as_duration() + check.interval.as_duration() * check.retries;
+    let deadline = Instant::now() + budget;
+    writeln!(out, "waiting  {container}  for the healthcheck")?;
+
+    loop {
+        match probe::probe(
+            runtime,
+            &container,
+            &check.exec,
+            check.timeout.as_duration(),
+        ) {
+            Ok(Probe::Healthy) => {
+                writeln!(out, "healthy  {container}")?;
+                return Ok(());
+            }
+            Ok(Probe::Failed { stderr }) => {
+                if !stderr.is_empty() {
+                    writeln!(out, "probe    {container}  {stderr}")?;
+                }
+            }
+            Ok(Probe::Unknown { reason }) => {
+                return Err(ApplyError::Runtime {
+                    context: format!("waiting for {container}"),
+                    error: RuntimeError::message(reason),
+                });
+            }
+            Ok(Probe::MissingBinary { binary, .. }) => {
+                return Err(ApplyError::Readiness {
+                    service: container,
+                    message: format!("the probe binary `{binary}` does not exist in the container"),
+                });
+            }
+            Err(error) => {
+                return Err(ApplyError::Runtime {
+                    context: format!("probing {container}"),
+                    error,
+                });
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(ApplyError::Readiness {
+                service: container,
+                message: format!("not healthy within {}ms", budget.as_millis()),
+            });
+        }
+        std::thread::sleep(
+            check
+                .interval
+                .as_duration()
+                .min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
 }
 
 /// `start` is asynchronous: poll until the container is `running`. A

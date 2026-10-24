@@ -404,9 +404,11 @@ fn inspect(args: &[String], world: &mut World) -> Result<(), Failure> {
 
 fn logs(args: &[String], _world: &mut World) -> Result<(), Failure> {
     let parsed = parse(args, &["-n", "--debug"], &["--boot", "--follow", "-f"])?;
-    if parsed.positionals.len() != 1 {
+    let [name] = parsed.positionals.as_slice() else {
         return Err(Failure::usage("a container id is required"));
-    }
+    };
+    // One deterministic line, so a caller's prefixing is observable.
+    println!("log line from {name}");
     Ok(())
 }
 

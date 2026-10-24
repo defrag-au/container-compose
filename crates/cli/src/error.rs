@@ -21,6 +21,10 @@ pub enum Error {
     Usage(String),
     /// A runtime command failed after the stack started changing.
     Runtime(String),
+    /// Containers are running but did not become healthy.
+    Readiness(String),
+    /// The second interrupt skipped the graceful stop.
+    Interrupted,
     /// Something that should not happen, such as rendering a document. Exit 1.
     Internal(String),
     /// `container` is missing, its output cannot be parsed, or the apiserver is down.
@@ -34,6 +38,8 @@ impl Error {
             Error::Refused(_) => 3,
             Error::Usage(_) => 2,
             Error::Runtime(_) => 1,
+            Error::Readiness(_) => 4,
+            Error::Interrupted => 130,
             Error::Internal(_) => 1,
             Error::Unavailable(_) => 5,
         }
@@ -57,6 +63,8 @@ impl fmt::Display for Error {
             Error::Internal(message) => write!(f, "{message}"),
             Error::Usage(message) => write!(f, "{message}"),
             Error::Runtime(message) => write!(f, "{message}"),
+            Error::Readiness(message) => write!(f, "{message}"),
+            Error::Interrupted => f.write_str("interrupted twice; containers were killed"),
             Error::Unavailable(message) => write!(f, "{message}"),
         }
     }
@@ -80,6 +88,7 @@ impl From<ApplyError> for Error {
     fn from(error: ApplyError) -> Self {
         match error {
             ApplyError::Usage(message) => Error::Usage(message),
+            ApplyError::Readiness { .. } => Error::Readiness(error.to_string()),
             other => Error::Runtime(other.to_string()),
         }
     }

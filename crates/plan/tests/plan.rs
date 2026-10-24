@@ -242,17 +242,38 @@ fn a_volume_size_change_is_refused() {
 }
 
 #[test]
-fn restart_is_refused_until_the_supervisor_lands() {
-    let (_dir, stack) =
-        temp_stack("version = 1\n[services.a]\nimage = \"img\"\nrestart = \"on-stop\"\n");
+fn restart_and_service_healthy_are_planned_now() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         name = \"health\"\n\
+         [services.a]\n\
+         image = \"img\"\n\
+         restart = \"on-stop\"\n\
+         [services.a.healthcheck]\n\
+         exec = [\"true\"]\n\
+         [services.b]\n\
+         image = \"img\"\n\
+         [[services.b.depends_on]]\n\
+         service = \"a\"\n\
+         condition = \"service_healthy\"\n",
+    );
     let mut world = world();
     with_image(&mut world, "img");
 
     let plan = plan(&stack, &world);
+    assert!(
+        plan.refusals.is_empty(),
+        "the supervisor honours both now: {:?}",
+        plan.refusals
+    );
     assert!(plan
-        .refusals
+        .steps
         .iter()
-        .any(|refusal| refusal.path == "[services.a].restart"));
+        .any(|step| step.action == Action::Create && step.name == "health-a"));
+    assert!(plan
+        .steps
+        .iter()
+        .any(|step| step.action == Action::Start && step.name == "health-b"));
 }
 
 #[test]

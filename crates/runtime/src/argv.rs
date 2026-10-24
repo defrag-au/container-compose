@@ -127,6 +127,10 @@ pub fn delete_container(name: &str, force: bool) -> Vec<String> {
     args
 }
 
+pub fn kill_container(name: &str) -> Vec<String> {
+    vec!["kill".to_owned(), name.to_owned()]
+}
+
 pub fn create_volume(stack: &ResolvedStack, volume: &ResolvedVolume) -> Vec<String> {
     let mut args = vec!["volume".to_owned(), "create".to_owned()];
     for (key, value) in [

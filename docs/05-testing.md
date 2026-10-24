@@ -172,9 +172,11 @@ both refused by `plan`/`up` and warned about by `config`; a `.gitignore` entry
 makes the same file accepted. The guard is three `git` questions against a
 fixture repository, not a pattern match on the path.
 
-**Signal handling.** The signal loop is a function of an event channel, so tests
-push `SigInt` and assert the stop order, then push a second and assert `kill`.
-No test sends a real signal to the test process.
+**Signal handling.** The shutdown decision (stop, leave, or kill) is a pure
+function, and the stop order is a pure function of the stack's order, so both are
+tested directly. One integration test starts a real child `up`, delivers SIGINT to
+it, and asserts the reverse stop order and that the lock is released; a second
+does the same with `--no-stop-on-exit`. No test signals the test process itself.
 
 ## Integration tests
 

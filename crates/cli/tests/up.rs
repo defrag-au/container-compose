@@ -17,6 +17,7 @@ use tempfile::TempDir;
 use container_compose_runtime::{
     ContainerConfiguration, ContainerImage, ContainerStatus, Observed, ObservedContainer,
 };
+use container_compose_supervisor::cache::{write_at, CachedHealth, HealthCache};
 
 #[derive(Debug, Deserialize)]
 struct Call {
@@ -29,6 +30,7 @@ struct Call {
 
 #[derive(Debug, Deserialize)]
 struct PlanDoc {
+    config: String,
     steps: Vec<StepDoc>,
 }
 
@@ -69,6 +71,7 @@ struct Fake {
     _dir: TempDir,
     bin: PathBuf,
     world: PathBuf,
+    cache: PathBuf,
 }
 
 impl Fake {
@@ -76,13 +79,16 @@ impl Fake {
         let dir = TempDir::new().expect("temp dir");
         let bin = dir.path().join("bin");
         let world = dir.path().join("world");
+        let cache = dir.path().join("cache");
         fs::create_dir(&bin).expect("create bin");
         fs::create_dir(&world).expect("create world");
+        fs::create_dir(&cache).expect("create cache");
         symlink(fake_binary(), bin.join("container")).expect("link the fake runtime");
         Self {
             _dir: dir,
             bin,
             world,
+            cache,
         }
     }
 
@@ -94,6 +100,7 @@ impl Fake {
                 format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.bin.display()),
             )
             .env("FAKE_CONTAINER_DIR", &self.world)
+            .env("CONTAINER_COMPOSE_CACHE_DIR", &self.cache)
             .args(args);
         command
     }
@@ -111,9 +118,32 @@ impl Fake {
     }
 
     fn observed(&self) -> Observed {
-        let text =
-            fs::read_to_string(self.world.join("world.json")).expect("the fake wrote a world");
-        serde_json::from_str(&text).expect("the fake world is the adapter's shape")
+        self.try_observed().expect("the fake wrote a world")
+    }
+
+    fn try_observed(&self) -> Option<Observed> {
+        let text = fs::read_to_string(self.world.join("world.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Wait until every named container is running, tolerating a poll that
+    /// catches `world.json` mid-write.
+    fn wait_until_running(&self, names: &[&str], timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if self.try_observed().is_some_and(|world| {
+                names.iter().all(|name| {
+                    world
+                        .containers
+                        .iter()
+                        .any(|container| container.id == *name && container.is_running())
+                })
+            }) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
     }
 
     fn seed(&self, observed: &Observed) {
@@ -570,15 +600,27 @@ command = ["sleep", "120"]
 }
 
 #[test]
-fn up_without_detach_is_refused_until_the_supervisor() {
+fn up_detached_with_a_restart_policy_is_refused() {
     let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(
+        &dir,
+        r#"version = 1
+name = "policy"
+[services.api]
+image = "docker.io/library/alpine:latest"
+command = ["sleep", "120"]
+restart = "on-stop"
+"#,
+    );
+
     let output = fake
-        .command(&["-f", &fixture("minimal"), "up"])
+        .command(&["-f", path.to_str().expect("utf-8"), "up", "-d"])
         .output()
         .expect("the command runs");
 
     assert_eq!(output.status.code(), Some(3));
-    assert!(stderr(&output).contains("M4"), "{}", stderr(&output));
+    assert!(stderr(&output).contains("restart"), "{}", stderr(&output));
     assert!(mutating(&fake.calls()).is_empty());
 }
 
@@ -869,4 +911,355 @@ command = ["sleep", "120"]
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "ghost-api");
     assert!(entries[0].ports.is_empty(), "no stack means no port specs");
+}
+
+fn gated_stack() -> &'static str {
+    r#"version = 1
+name = "gate"
+[services.a]
+image = "docker.io/library/alpine:latest"
+command = ["sleep", "120"]
+[services.a.healthcheck]
+exec = ["true"]
+interval = "10ms"
+timeout = "1s"
+start_period = "0s"
+retries = 1
+[services.b]
+image = "docker.io/library/alpine:latest"
+command = ["sleep", "120"]
+[[services.b.depends_on]]
+service = "a"
+condition = "service_healthy"
+"#
+}
+
+#[test]
+fn wait_waits_for_a_healthy_started_service() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, gated_stack());
+
+    let output = fake
+        .command(&["-f", path.to_str().expect("utf-8"), "up", "-d", "--wait"])
+        .output()
+        .expect("the command runs");
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|call| call.argv.first().map(String::as_str) == Some("exec")),
+        "readiness ran a probe"
+    );
+    assert!(fake
+        .container("gate-b")
+        .is_some_and(|container| container.is_running()));
+}
+
+#[test]
+fn a_failed_healthcheck_exits_four_and_leaves_the_container_running() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, gated_stack());
+    fake.inject(&Injection {
+        subcommand: "exec",
+        needle: Some("gate-a"),
+        exit: 1,
+        stderr: "Error: probe failed",
+    });
+
+    let output = fake
+        .command(&["-f", path.to_str().expect("utf-8"), "up", "-d", "--wait"])
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("did not become healthy"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        fake.container("gate-a")
+            .is_some_and(|container| container.is_running()),
+        "exit 4 means the container is running but unhealthy"
+    );
+}
+
+#[test]
+fn service_healthy_holds_the_dependent_start() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, gated_stack());
+    fake.inject(&Injection {
+        subcommand: "exec",
+        needle: Some("gate-a"),
+        exit: 1,
+        stderr: "Error: probe failed",
+    });
+
+    let output = fake
+        .command(&["-f", path.to_str().expect("utf-8"), "up", "-d"])
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(output.status.code(), Some(4), "stderr: {}", stderr(&output));
+    let started: Vec<String> = mutating(&fake.calls())
+        .into_iter()
+        .filter(|argv| argv.first().map(String::as_str) == Some("start"))
+        .filter_map(|argv| argv.last().cloned())
+        .collect();
+    assert_eq!(
+        started,
+        ["gate-a"],
+        "b waits for a's health, and never starts"
+    );
+    assert!(
+        fake.container("gate-b")
+            .is_some_and(|container| !container.is_running()),
+        "b exists because creates run before starts, but it was not started"
+    );
+}
+
+#[test]
+fn logs_prefix_multiple_services_and_pass_one_through() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+    let path = path.to_str().expect("utf-8").to_owned();
+    let up = fake
+        .command(&["-f", &path, "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success(), "stderr: {}", stderr(&up));
+
+    let both = fake.command(&["-f", &path, "logs"]).output().expect("runs");
+    assert!(both.status.success(), "stderr: {}", stderr(&both));
+    let text = stdout(&both);
+    assert!(text.contains("a | log line from two-a"), "{text}");
+    assert!(text.contains("b | log line from two-b"), "{text}");
+
+    let one = fake
+        .command(&["-f", &path, "logs", "a"])
+        .output()
+        .expect("runs");
+    assert!(one.status.success(), "stderr: {}", stderr(&one));
+    assert_eq!(stdout(&one).trim(), "log line from two-a");
+}
+
+#[test]
+fn down_refuses_while_a_supervisor_holds_the_lock() {
+    let fake = Fake::new();
+    fs::write(
+        fake.cache.join("minimal.lock"),
+        std::process::id().to_string(),
+    )
+    .expect("write the lock");
+
+    let output = fake
+        .command(&["-f", &fixture("minimal"), "down"])
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr(&output));
+    assert!(
+        stderr(&output).contains("supervisor is running"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(mutating(&fake.calls()).is_empty(), "nothing was stopped");
+}
+
+#[test]
+fn a_second_up_is_refused_while_the_lock_is_held() {
+    let fake = Fake::new();
+    fs::write(
+        fake.cache.join("minimal.lock"),
+        std::process::id().to_string(),
+    )
+    .expect("write the lock");
+
+    let output = fake
+        .command(&["-f", &fixture("minimal"), "up", "-d"])
+        .output()
+        .expect("the command runs");
+
+    assert_eq!(output.status.code(), Some(3), "stderr: {}", stderr(&output));
+    assert!(mutating(&fake.calls()).is_empty());
+}
+
+#[test]
+fn ps_reads_a_live_supervisors_health_cache() {
+    let fake = Fake::new();
+    let up = fake
+        .command(&["-f", &fixture("minimal"), "up", "-d"])
+        .output()
+        .expect("runs");
+    assert!(up.status.success());
+
+    let plan = fake
+        .command(&["-f", &fixture("minimal"), "plan", "--json"])
+        .output()
+        .expect("runs");
+    let document: PlanDoc = serde_json::from_slice(&plan.stdout).expect("a plan");
+    let path = fake.cache.join("minimal.json");
+    write_at(
+        &path,
+        &HealthCache {
+            pid: std::process::id(),
+            project: "minimal".to_owned(),
+            config: document.config.clone(),
+            updated_at: "2026-10-24T00:00:00Z".to_owned(),
+            services: BTreeMap::from([(
+                "echo".to_owned(),
+                CachedHealth {
+                    state: "healthy".to_owned(),
+                    checked_at: Some("2026-10-24T00:00:01Z".to_owned()),
+                },
+            )]),
+        },
+    )
+    .expect("write the cache");
+
+    let listed = fake
+        .command(&["-f", &fixture("minimal"), "ps", "--json"])
+        .output()
+        .expect("runs");
+    let entries: Vec<PsDoc> = serde_json::from_slice(&listed.stdout).expect("typed records");
+    assert_eq!(entries[0].health.state, "healthy");
+    assert_eq!(entries[0].health.source, "supervisor");
+
+    write_at(
+        &path,
+        &HealthCache {
+            pid: std::process::id(),
+            project: "minimal".to_owned(),
+            config: "stale".to_owned(),
+            updated_at: "2026-10-24T00:00:00Z".to_owned(),
+            services: BTreeMap::from([(
+                "echo".to_owned(),
+                CachedHealth {
+                    state: "healthy".to_owned(),
+                    checked_at: None,
+                },
+            )]),
+        },
+    )
+    .expect("rewrite the cache");
+    let listed = fake
+        .command(&["-f", &fixture("minimal"), "ps", "--json"])
+        .output()
+        .expect("runs");
+    let entries: Vec<PsDoc> = serde_json::from_slice(&listed.stdout).expect("typed records");
+    assert_eq!(
+        entries[0].health.state, "unknown",
+        "a config mismatch is never a stale healthy"
+    );
+    assert_eq!(entries[0].health.source, "none");
+}
+
+fn spawn_up(fake: &Fake, path: &str, extra: &[&str]) -> std::process::Child {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_container-compose"));
+    command
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake.bin.display()),
+        )
+        .env("FAKE_CONTAINER_DIR", &fake.world)
+        .env("CONTAINER_COMPOSE_CACHE_DIR", &fake.cache)
+        .args(["-f", path, "up"])
+        .args(extra)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    command.spawn().expect("the binary starts")
+}
+
+fn interrupt(child: &std::process::Child) {
+    let status = std::process::Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("kill runs");
+    assert!(status.success(), "the signal was delivered");
+}
+
+fn wait_with_deadline(
+    mut child: std::process::Child,
+    deadline: std::time::Duration,
+) -> std::process::Output {
+    let limit = std::time::Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().expect("the output is readable"),
+            Ok(None) if std::time::Instant::now() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                panic!("the supervisor did not exit within {deadline:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn ctrl_c_stops_in_reverse_order_and_releases_the_lock() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+    let path_string = path.to_str().expect("utf-8").to_owned();
+
+    let child = spawn_up(&fake, &path_string, &[]);
+    assert!(
+        fake.wait_until_running(&["two-a", "two-b"], std::time::Duration::from_secs(10)),
+        "both containers started before the interrupt"
+    );
+    // The start phase finishes before the supervisor installs its handlers;
+    // SIGINT in that window would take the default action.
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+    assert!(
+        fake.cache.join("two.lock").exists(),
+        "the supervisor holds the lock"
+    );
+
+    interrupt(&child);
+    let output = wait_with_deadline(child, std::time::Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+
+    let text = stderr(&output);
+    let b = text.find("stopping two-b").expect("b is stopped first");
+    let a = text.find("stopping two-a").expect("a is stopped second");
+    assert!(b < a, "reverse dependency order:\n{text}");
+    assert!(
+        !fake.cache.join("two.lock").exists(),
+        "the lock is released"
+    );
+}
+
+#[test]
+fn no_stop_on_exit_leaves_containers_running() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, two_services());
+
+    let child = spawn_up(&fake, path.to_str().expect("utf-8"), &["--no-stop-on-exit"]);
+    assert!(
+        fake.wait_until_running(&["two-a", "two-b"], std::time::Duration::from_secs(10)),
+        "both containers started before the interrupt"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_500));
+
+    interrupt(&child);
+    let output = wait_with_deadline(child, std::time::Duration::from_secs(10));
+    assert_eq!(output.status.code(), Some(0), "stderr: {}", stderr(&output));
+    assert!(stderr(&output).contains("leaving"), "{}", stderr(&output));
+    assert!(
+        fake.container("two-a")
+            .is_some_and(|container| container.is_running())
+            && fake
+                .container("two-b")
+                .is_some_and(|container| container.is_running()),
+        "the first interrupt was asked to leave them"
+    );
 }

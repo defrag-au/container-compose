@@ -42,6 +42,7 @@ struct Fake {
     _dir: TempDir,
     bin: PathBuf,
     world: PathBuf,
+    cache: PathBuf,
 }
 
 impl Fake {
@@ -49,13 +50,16 @@ impl Fake {
         let dir = TempDir::new().expect("temp dir");
         let bin = dir.path().join("bin");
         let world = dir.path().join("world");
+        let cache = dir.path().join("cache");
         fs::create_dir(&bin).expect("create bin");
         fs::create_dir(&world).expect("create world");
+        fs::create_dir(&cache).expect("create cache");
         symlink(fake_binary(), bin.join("container")).expect("link the fake runtime");
         Self {
             _dir: dir,
             bin,
             world,
+            cache,
         }
     }
 
@@ -67,6 +71,7 @@ impl Fake {
                 format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.bin.display()),
             )
             .env("FAKE_CONTAINER_DIR", &self.world)
+            .env("CONTAINER_COMPOSE_CACHE_DIR", &self.cache)
             .args(args);
         command
     }
@@ -196,7 +201,7 @@ fn a_refusal_prints_the_plan_and_exits_three() {
     let stack = project.join("stack.toml");
     fs::write(
         &stack,
-        "version = 1\n[services.a]\nimage = \"img\"\nrestart = \"on-stop\"\n",
+        "version = 1\n[services.a]\nimage = \"img\"\npull = \"never\"\n",
     )
     .expect("write stack");
 
@@ -208,16 +213,16 @@ fn a_refusal_prints_the_plan_and_exits_three() {
     assert_eq!(output.status.code(), Some(3));
     let stderr = String::from_utf8(output.stderr).expect("utf-8");
     assert!(stderr.contains("refused"), "{stderr}");
-    assert!(stderr.contains("[services.a].restart"), "{stderr}");
+    assert!(stderr.contains("[services.a].pull"), "{stderr}");
 
     let document: PlanDoc =
         serde_json::from_slice(&output.stdout).expect("the plan is still printed");
     let refusal = document
         .refusals
         .iter()
-        .find(|refusal| refusal.path == "[services.a].restart")
-        .expect("a restart refusal");
-    assert!(refusal.message.contains("supervisor"), "{refusal:?}");
+        .find(|refusal| refusal.path == "[services.a].pull")
+        .expect("a pull refusal");
+    assert!(refusal.message.contains("not present"), "{refusal:?}");
 }
 
 #[test]

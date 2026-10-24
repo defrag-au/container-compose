@@ -9,10 +9,12 @@ pub mod argv;
 pub mod command;
 pub mod labels;
 pub mod observe;
+pub mod probe;
 
-pub use command::{Command, Output, RuntimeError};
+pub use command::{Command, Completion, Output, RuntimeError};
 pub use observe::{
     observe, ContainerConfiguration, ContainerImage, ContainerStatus, ImageConfiguration,
     NetworkConfiguration, NetworkStatus, Observed, ObservedContainer, ObservedImage,
     ObservedNetwork, ObservedVolume, VolumeConfiguration,
 };
+pub use probe::{probe, Probe};

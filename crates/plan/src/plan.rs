@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use container_compose_runtime::{argv, Observed};
-use container_compose_stack::model::{Condition, NetworkMode, PullPolicy, RestartPolicy};
+use container_compose_stack::model::{NetworkMode, PullPolicy};
 use container_compose_stack::resolve::{Journal, ResolvedService, ResolvedStack, ResolvedVolume};
 use serde::Serialize;
 
@@ -169,37 +169,6 @@ pub fn plan_with(stack: &ResolvedStack, observed: &Observed, options: &Options) 
             .expect("the start order names a service");
         let container_name = argv::container_name(&stack.name, name);
         let service_path = format!("[services.{name}]");
-
-        if service.restart != RestartPolicy::No {
-            refusals.push(Refusal::new(
-                format!("{service_path}.restart"),
-                format!(
-                    "`restart = \"{}\"` needs the foreground supervisor, which lands in M4",
-                    service.restart.as_str()
-                ),
-            ));
-        }
-        if service
-            .depends_on
-            .iter()
-            .any(|dependency| dependency.condition == Condition::ServiceHealthy)
-        {
-            refusals.push(Refusal::new(
-                format!("{service_path}.depends_on"),
-                "`service_healthy` waits for readiness, which lands in M4",
-            ));
-        }
-        if service.healthcheck.is_some() {
-            warnings.push(Step::new(
-                Action::Warn,
-                Resource::Container,
-                container_name.clone(),
-                Detail::Note {
-                    message: "healthcheck declared; probes start in M4".to_owned(),
-                },
-                None,
-            ));
-        }
 
         match observed.container(&container_name) {
             None => {

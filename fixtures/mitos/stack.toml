@@ -24,7 +24,7 @@ ports = ["127.0.0.1:8184:8184"]
 cpus = 4
 memory = "8G"
 ulimits = ["nofile=65536:65536"]
-restart = "no"
+restart = "always"
 
 [services.sieve.healthcheck]
 exec = ["curl", "-fsS", "http://127.0.0.1:8184/health"]
@@ -46,7 +46,7 @@ volumes = ["ledger:/db"]
 ports = ["127.0.0.1:8185:8185"]
 cpus = 4
 memory = "8G"
-restart = "no"
+restart = "on-stop"
 
 [[services.ledger.depends_on]]
 service = "sieve"

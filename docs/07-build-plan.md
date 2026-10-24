@@ -1,13 +1,14 @@
 # 07 — Build plan
 
-Status: **M0, M1, M2 and M3 complete, 2026-10-24.** The runtime probe is done;
-the stack model, parser, validator, resolver, hash and `config` command are built;
-and the runtime adapter, the fake runtime, `plan`, and `up -d` / `down` / `ps` are
-built (106 tests, `cargo clippy -D warnings` clean). The supervisor, healthchecks
-and `exec`/`run`/`build`/`pull` are next. This document records what the runtime
-actually does, the design changes that follow, and the order the build goes in. It
-supersedes the corresponding rows of `01`–`05` where they disagree; the deltas are
-listed first so they are not missed.
+Status: **M0, M1, M2, M3 and M4 complete, 2026-10-24.** The runtime probe is
+done; the stack model, parser, validator, resolver, hash and `config` command are
+built; the runtime adapter, the fake runtime, `plan`, `up` (foreground and `-d`),
+`down`, `ps`, `logs`, the supervisor, healthchecks and the health cache are built.
+The remaining verbs (`exec`, `run`, `build`, `pull`) and isolated networks are
+next. This document records what the runtime actually does, the design changes
+that follow, and the order the build goes in. It supersedes the corresponding
+rows of `01`–`05` where they disagree; the deltas are listed first so they are
+not missed.
 
 The probe used `container` 1.6.0 (Homebrew) on macOS 27.0.1, arm64, with the
 recommended kernel installed. Every JSON fragment below is copied from a real
@@ -474,6 +475,32 @@ Exit: fake-clock crash loop and backoff sequence; a stop the supervisor issued
 is never restarted and a stop it did not issue is; `down` refuses while the
 supervisor holds the lock; Ctrl-C ordering; a killed supervisor leaves containers
 running and the next `up` adopts them.
+
+**Done.** `crates/supervisor` holds the tick machine (pure, fake clock), the
+runner, the health cache and the pid lock. `up` without `-d` now reconciles,
+waits for readiness and supervises until Ctrl-C; `up -d` is refused when any
+service asks for a restart. `--wait`, `--no-stop-on-exit`, `logs`,
+`logs --follow`, exit 4 and exit 130 are in place. A probe that reports the
+container is not running counts for nothing; one that cannot find its binary is
+a failure with the binary named; failures inside `start_period` leave the state
+`starting`. `down` refuses while a live supervisor holds the lock and removes a
+dead project's health cache. The mitos fixture is back to `restart = "always"`
+(`sieve`) and `on-stop` (`ledger`).
+
+One delta from `03-cli.md`: `logs` has no `-f` short flag. `-f` is already the
+global `--file`, and clap refuses duplicate shorts, so following is `--follow`
+only.
+
+Verified: 8 fake-clock tick tests (the 1, 2, 4, 8, 16, 30, 30 sequence, `on-stop`
+give-up, intent, the 60 s reset, `start_period`, probe scheduling, and a restart
+that never produces a running container), 3 clock, 4 cache, 2 lock and 3
+shutdown-decision tests; 10 CLI cases for readiness, gating, logs, the cache `ps`
+reads, and the lock. One integration test starts a real
+child `up`, sends it SIGINT and asserts the reverse stop order and the released
+lock; another does the same with `--no-stop-on-exit`. Against the real runtime, a
+`restart = "on-stop"`, `max_retries = 3` service that exits after two seconds was
+restarted at 1 s, 2 s and 4 s, gave up, and a SIGINT stopped it, removed the lock
+and left the container stopped for `down`.
 
 ### M5 — the rest
 

@@ -1,24 +1,29 @@
 //! The command line.
 //!
-//! `config`, `plan`, `up`, `down` and `ps` are implemented. The supervisor
-//! commands arrive in M4; until then `up` requires `-d`, because the foreground
-//! mode is the supervisor.
+//! `config`, `plan`, `up` (foreground and detached), `down`, `ps` and `logs`
+//! are implemented. The foreground `up` is the supervisor.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use container_compose_plan::apply::{self, DownOptions, UpOptions};
 use container_compose_plan::{plan as build_plan, plan_with, Detail, Plan, PlanOptions, Refusal};
-use container_compose_runtime::observe;
-use container_compose_runtime::ObservedContainer;
+use container_compose_runtime::{argv, observe, Command as RuntimeCommand, ObservedContainer};
 use container_compose_stack::duration::Span;
 use container_compose_stack::env::{self, Guard};
+use container_compose_stack::model::RestartPolicy;
 use container_compose_stack::ports::Protocol;
 use container_compose_stack::resolve::{MountSource, ResolvedService, ResolvedStack};
 use container_compose_stack::{self as stack, Options};
+use container_compose_supervisor::cache;
+use container_compose_supervisor::lock::{self, LockError};
+use container_compose_supervisor::{
+    run as supervise, Options as SupervisorOptions, SupervisorError,
+};
 
 use crate::error::Error;
 
@@ -78,7 +83,7 @@ pub enum Command {
     Up {
         /// Start these services and their dependencies; default is all.
         services: Vec<String>,
-        /// Create and start, then exit. The foreground supervisor lands in M4.
+        /// Create and start, then exit. Requires every service to be `restart = "no"`.
         #[arg(short = 'd', long)]
         detach: bool,
         /// Graceful stop window on the failure path.
@@ -90,6 +95,12 @@ pub enum Command {
         /// Refuse a config mismatch instead of replacing the container.
         #[arg(long)]
         no_recreate: bool,
+        /// With `-d`, wait for readiness before exiting.
+        #[arg(long)]
+        wait: bool,
+        /// On Ctrl-C, leave everything running.
+        #[arg(long)]
+        no_stop_on_exit: bool,
         /// Print the plan instead of applying it.
         #[arg(long)]
         dry_run: bool,
@@ -112,6 +123,17 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a service's logs.
+    Logs {
+        /// Services to show; default is all.
+        services: Vec<String>,
+        /// Follow the output.
+        #[arg(long)]
+        follow: bool,
+        /// Lines from the end.
+        #[arg(short = 'n', long, default_value = "200")]
+        lines: u32,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<(), Error> {
@@ -124,15 +146,21 @@ pub fn run(cli: Cli) -> Result<(), Error> {
             timeout,
             keep_started,
             no_recreate,
+            wait,
+            no_stop_on_exit,
             dry_run,
         } => up_command(
             &cli,
-            services,
-            *detach,
-            *timeout,
-            *keep_started,
-            *no_recreate,
-            *dry_run,
+            &UpFlags {
+                services,
+                detach: *detach,
+                timeout: *timeout,
+                keep_started: *keep_started,
+                no_recreate: *no_recreate,
+                wait: *wait,
+                no_stop_on_exit: *no_stop_on_exit,
+                dry_run: *dry_run,
+            },
         ),
         Command::Down {
             volumes,
@@ -140,6 +168,11 @@ pub fn run(cli: Cli) -> Result<(), Error> {
             dry_run,
         } => down_command(&cli, *volumes, *timeout, *dry_run),
         Command::Ps { json } => ps_command(&cli, *json),
+        Command::Logs {
+            services,
+            follow,
+            lines,
+        } => logs_command(&cli, services, *follow, *lines),
     }
 }
 
@@ -191,31 +224,60 @@ fn print_plan(cli: &Cli, stack: &ResolvedStack, commands: bool, json: bool) -> R
     }
 }
 
-fn up_command(
-    cli: &Cli,
-    services: &[String],
+struct UpFlags<'a> {
+    services: &'a [String],
     detach: bool,
     timeout: Span,
     keep_started: bool,
     no_recreate: bool,
+    wait: bool,
+    no_stop_on_exit: bool,
     dry_run: bool,
-) -> Result<(), Error> {
+}
+
+fn up_command(cli: &Cli, flags: &UpFlags<'_>) -> Result<(), Error> {
     let stack = load_checked(cli, true)?;
 
-    if dry_run {
+    if flags.dry_run {
         return print_plan(cli, &stack, false, false);
     }
-    if !detach {
-        return Err(Error::Refused(vec![Refusal {
+
+    // One supervisor per project. The lock is held for the whole command —
+    // through the foreground loop — and a stale pid does not block.
+    let _lock = lock::Lock::acquire(&stack.name).map_err(|error| match error {
+        LockError::Held { .. } => Error::Refused(vec![Refusal {
             path: "up".to_owned(),
-            message: "foreground `up` needs the supervisor, which lands in M4; \
-                      run `up -d`"
-                .to_owned(),
-        }]));
+            message: error.to_string(),
+        }]),
+        LockError::Io(error) => Error::Internal(error.to_string()),
+    })?;
+
+    if flags.detach {
+        // `-d` exits immediately, so no process is left to honour a policy.
+        if let Some(service) = stack
+            .services
+            .values()
+            .find(|service| service.restart != RestartPolicy::No)
+        {
+            return Err(Error::Refused(vec![Refusal {
+                path: format!("[services.{}].restart", service.name),
+                message: format!(
+                    "`up -d` cannot honour `restart = \"{}\"`; run `up` in the foreground, \
+                     or set `restart = \"no\"`",
+                    service.restart.as_str()
+                ),
+            }]));
+        }
     }
 
     let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
-    let plan = plan_with(&stack, &observed, &PlanOptions { no_recreate });
+    let plan = plan_with(
+        &stack,
+        &observed,
+        &PlanOptions {
+            no_recreate: flags.no_recreate,
+        },
+    );
     if !plan.refusals.is_empty() {
         eprint!("{}", render_table(&plan));
         return Err(Error::Refused(plan.refusals));
@@ -223,12 +285,37 @@ fn up_command(
 
     let options = UpOptions {
         runtime: cli.runtime.clone(),
-        services: services.to_vec(),
-        timeout: timeout_secs(timeout),
-        keep_started,
+        services: flags.services.to_vec(),
+        timeout: timeout_secs(flags.timeout),
+        keep_started: flags.keep_started,
+        // Foreground `up` waits for readiness before supervising; `-d` waits
+        // only when asked.
+        wait: !flags.detach || flags.wait,
         verbose: cli.verbose,
     };
-    apply::up(&stack, &plan, &options, &mut std::io::stderr()).map_err(Error::from)
+    let outcome = apply::up(&stack, &plan, &options, &mut std::io::stderr())?;
+
+    if flags.detach {
+        return Ok(());
+    }
+
+    let supervisor_options = SupervisorOptions {
+        runtime: cli.runtime.clone(),
+        poll_interval: std::time::Duration::from_secs(1),
+        stop_timeout: timeout_secs(flags.timeout),
+        no_stop_on_exit: flags.no_stop_on_exit,
+        verbose: cli.verbose,
+    };
+    supervise(
+        &stack,
+        &outcome.selected,
+        &supervisor_options,
+        &mut std::io::stderr(),
+    )
+    .map_err(|error| match error {
+        SupervisorError::Killed => Error::Interrupted,
+        other => Error::Runtime(other.to_string()),
+    })
 }
 
 fn down_command(cli: &Cli, volumes: bool, timeout: Span, dry_run: bool) -> Result<(), Error> {
@@ -238,6 +325,17 @@ fn down_command(cli: &Cli, volumes: bool, timeout: Span, dry_run: bool) -> Resul
             project_name: cli.project_name.clone(),
         },
     )?;
+
+    // A supervisor would restart what `down` stopped, so it has to go first.
+    if let Some(pid) = lock::owner(&stack.name) {
+        return Err(Error::Refused(vec![Refusal {
+            path: "down".to_owned(),
+            message: format!(
+                "a supervisor is running for this project (pid {pid}); stop it before `down`"
+            ),
+        }]));
+    }
+
     let observed = observe(&cli.runtime).map_err(|error| Error::Unavailable(error.to_string()))?;
 
     let options = DownOptions {
@@ -247,7 +345,12 @@ fn down_command(cli: &Cli, volumes: bool, timeout: Span, dry_run: bool) -> Resul
         dry_run,
         verbose: cli.verbose,
     };
-    apply::down(&stack, &observed, &options, &mut std::io::stderr()).map_err(Error::from)
+    apply::down(&stack, &observed, &options, &mut std::io::stderr())?;
+    if !dry_run {
+        // The supervisor is gone with the lock, so the cache is only clutter.
+        cache::remove(&stack.name);
+    }
+    Ok(())
 }
 
 fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
@@ -270,6 +373,13 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
         .as_ref()
         .map(|stack| stack.name.clone())
         .unwrap_or_else(|| project_from_path(cli));
+
+    // Only a live supervisor's cache is trusted, and only for the same stack
+    // config. A missing file, a dead pid or a hash mismatch is `unknown`.
+    let health_cache = cache::live(
+        &project,
+        stack.as_ref().map(|stack| stack.config_hash.as_str()),
+    );
 
     let mut containers: Vec<&ObservedContainer> = observed
         .containers
@@ -296,15 +406,32 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
                 })
                 .map(render_ports)
                 .unwrap_or_default();
+            let cached = if container.is_running() {
+                health_cache.as_ref().and_then(|cache| {
+                    container
+                        .service()
+                        .and_then(|name| cache.services.get(name))
+                })
+            } else {
+                None
+            };
+            let health = cached.map_or_else(
+                || PsHealth {
+                    state: "unknown".to_owned(),
+                    checked_at: None,
+                    source: "none".to_owned(),
+                },
+                |cached| PsHealth {
+                    state: cached.state.clone(),
+                    checked_at: cached.checked_at.clone(),
+                    source: "supervisor".to_owned(),
+                },
+            );
             PsEntry {
                 name: container.id.clone(),
                 service: container.service().map(str::to_owned),
                 state: container.status.state.clone(),
-                health: PsHealth {
-                    state: "unknown",
-                    checked_at: None,
-                    source: "none",
-                },
+                health,
                 image: container.configuration.image.reference.clone(),
                 ports,
             }
@@ -322,6 +449,104 @@ fn ps_command(cli: &Cli, json: bool) -> Result<(), Error> {
         println!();
     }
     Ok(())
+}
+
+fn logs_command(cli: &Cli, services: &[String], follow: bool, lines: u32) -> Result<(), Error> {
+    let stack = stack::load(
+        &cli.file,
+        &Options {
+            project_name: cli.project_name.clone(),
+        },
+    )?;
+
+    let selected: Vec<String> = if services.is_empty() {
+        stack.order.clone()
+    } else {
+        for name in services {
+            if !stack.services.contains_key(name) {
+                return Err(Error::Usage(format!("no service named `{name}`")));
+            }
+        }
+        services.to_vec()
+    };
+
+    let targets: Vec<(String, Vec<String>)> = selected
+        .iter()
+        .map(|service| {
+            let container = argv::container_name(&stack.name, service);
+            (service.clone(), argv::logs(&container, follow, Some(lines)))
+        })
+        .collect();
+
+    // One service: pass the output through unmodified.
+    if targets.len() == 1 {
+        let (_, log_argv) = &targets[0];
+        let mut print = |line: &str| println!("{line}");
+        RuntimeCommand::new(&cli.runtime)
+            .args(log_argv.iter().cloned())
+            .stream_lines(&mut print)
+            .map_err(|error| Error::Runtime(error.to_string()))?;
+        return Ok(());
+    }
+
+    // More than one: every line carries its service name. Without `--follow`
+    // the streams are finite, so sequential is honest.
+    if !follow {
+        for (service, log_argv) in &targets {
+            let mut print = |line: &str| println!("{service} | {line}");
+            RuntimeCommand::new(&cli.runtime)
+                .args(log_argv.iter().cloned())
+                .stream_lines(&mut print)
+                .map_err(|error| Error::Runtime(error.to_string()))?;
+        }
+        return Ok(());
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    for (service, log_argv) in targets {
+        let runtime = cli.runtime.clone();
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let lines = sender.clone();
+            let label = service.clone();
+            let mut send = move |line: &str| {
+                let _ = lines.send(LogEvent::Line {
+                    service: label.clone(),
+                    text: line.to_owned(),
+                });
+            };
+            if let Err(error) = RuntimeCommand::new(runtime)
+                .args(log_argv.iter().cloned())
+                .stream_lines(&mut send)
+            {
+                let _ = sender.send(LogEvent::Failed {
+                    service,
+                    message: error.to_string(),
+                });
+            }
+        });
+    }
+    drop(sender);
+
+    let mut failure = None;
+    for event in receiver {
+        match event {
+            LogEvent::Line { service, text } => println!("{service} | {text}"),
+            LogEvent::Failed { service, message } => {
+                eprintln!("{service}: {message}");
+                failure = Some(message);
+            }
+        }
+    }
+    match failure {
+        Some(message) => Err(Error::Runtime(message)),
+        None => Ok(()),
+    }
+}
+
+enum LogEvent {
+    Line { service: String, text: String },
+    Failed { service: String, message: String },
 }
 
 fn project_from_path(cli: &Cli) -> String {
@@ -577,9 +802,9 @@ struct PsEntry {
 
 #[derive(Debug, Serialize)]
 struct PsHealth {
-    state: &'static str,
+    state: String,
     checked_at: Option<String>,
-    source: &'static str,
+    source: String,
 }
 
 fn render_ps(entries: &[PsEntry]) -> String {
