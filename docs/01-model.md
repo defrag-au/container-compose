@@ -35,7 +35,9 @@ version of what was written.
 Dashes rather than underscores because a container's name doubles as its DNS
 label (`mitos-sieve.test`). A name that is not a legal DNS label would work as
 a container name and fail as a hostname, which is the kind of split-brain the
-tool exists to remove.
+tool exists to remove. The label is usable only once a DNS domain is registered
+on the host, which is admin setup the tool does not perform — see
+[`04-runtime.md`](04-runtime.md#dns-is-a-two-step-setup).
 
 The name is the identity. The tool never tracks a container ID between
 invocations — it lists, filters by label, and matches by name. An ID is a

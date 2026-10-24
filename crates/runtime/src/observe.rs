@@ -16,6 +16,10 @@ use crate::labels;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Observed {
+    /// The domains `container system dns list` reports. Empty means container
+    /// names do not resolve at all — see `docs/04-runtime.md`.
+    #[serde(default)]
+    pub dns_domains: Vec<String>,
     #[serde(default)]
     pub containers: Vec<ObservedContainer>,
     #[serde(default)]
@@ -129,6 +133,10 @@ pub fn observe(program: &str) -> Result<Observed, RuntimeError> {
     }
 
     Ok(Observed {
+        dns_domains: parse(
+            "`container system dns list`",
+            &run(program, &["system", "dns", "list", "--format", "json"])?,
+        )?,
         containers: parse(
             "`container list`",
             &run(program, &["list", "--all", "--format", "json"])?,
@@ -173,9 +181,10 @@ impl Observed {
     }
 
     pub fn image(&self, reference: &str) -> Option<&ObservedImage> {
-        self.images
-            .iter()
-            .find(|image| image.configuration.name == reference)
+        let normalized = normalize_image_reference(reference);
+        self.images.iter().find(|image| {
+            image.configuration.name == reference || image.configuration.name == normalized
+        })
     }
 }
 
@@ -236,4 +245,92 @@ fn run(program: &str, args: &[&str]) -> Result<String, RuntimeError> {
 fn parse<T: serde::de::DeserializeOwned>(what: &str, text: &str) -> Result<T, RuntimeError> {
     serde_json::from_str(text)
         .map_err(|error| RuntimeError::message(format!("cannot parse {what}: {error}")))
+}
+
+/// The reference the runtime records when a short name is pulled.
+///
+/// `container image pull alpine` stores `docker.io/library/alpine:latest`; the
+/// same is true of `midnightntwrk/midnight-node:…` and of a locally built
+/// `mitos-local:dev`. Comparing the file's spelling literally makes `pull =
+/// "missing"` re-pull forever and makes `pull = "never"` refuse an image that
+/// is present.
+pub fn normalize_image_reference(reference: &str) -> String {
+    let (body, digest) = match reference.split_once('@') {
+        Some((body, digest)) => (body, Some(digest)),
+        None => (reference, None),
+    };
+
+    // A tag is a colon after the last slash; a registry port is before it.
+    let last_slash = body.rfind('/');
+    let tag_start = body
+        .rfind(':')
+        .filter(|colon| last_slash.map(|slash| *colon > slash).unwrap_or(true));
+    let (name, tag) = match tag_start {
+        Some(colon) => (&body[..colon], Some(&body[colon + 1..])),
+        None => (body, None),
+    };
+
+    let first = name.split('/').next().unwrap_or(name);
+    let qualified = first.contains('.') || first.contains(':') || first == "localhost";
+    let mut normalized = if qualified {
+        name.to_owned()
+    } else if name.contains('/') {
+        format!("docker.io/{name}")
+    } else {
+        format!("docker.io/library/{name}")
+    };
+
+    if let Some(digest) = digest {
+        normalized.push('@');
+        normalized.push_str(digest);
+    } else {
+        normalized.push(':');
+        normalized.push_str(tag.unwrap_or("latest"));
+    }
+    normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_image_reference;
+
+    #[test]
+    fn short_references_normalize_to_the_runtimes_spelling() {
+        assert_eq!(
+            normalize_image_reference("alpine"),
+            "docker.io/library/alpine:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("alpine:3.22"),
+            "docker.io/library/alpine:3.22"
+        );
+        assert_eq!(
+            normalize_image_reference("midnightntwrk/midnight-node:2.1.0-rc.3"),
+            "docker.io/midnightntwrk/midnight-node:2.1.0-rc.3"
+        );
+        assert_eq!(
+            normalize_image_reference("mitos-local:dev"),
+            "docker.io/library/mitos-local:dev"
+        );
+    }
+
+    #[test]
+    fn a_qualified_reference_is_unchanged() {
+        assert_eq!(
+            normalize_image_reference("ghcr.io/midnightntwrk/indexer-standalone:4.4.0"),
+            "ghcr.io/midnightntwrk/indexer-standalone:4.4.0"
+        );
+        assert_eq!(
+            normalize_image_reference("docker.io/library/alpine:latest"),
+            "docker.io/library/alpine:latest"
+        );
+    }
+
+    #[test]
+    fn a_digest_is_preserved_and_no_tag_is_added() {
+        assert_eq!(
+            normalize_image_reference("docker.io/foo/bar@sha256:abcdef"),
+            "docker.io/foo/bar@sha256:abcdef"
+        );
+    }
 }

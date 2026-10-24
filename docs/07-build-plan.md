@@ -105,8 +105,12 @@ Consequences:
   exception in `01-model.md` and `02-stack-file.md` is removed.
 - The mitos fixture's `spool` (rw for `sieve`, `:ro` for `ledger`) is invalid as
   written. It needs one container running both processes — the fallback `06`
-  anticipated — or a host bind mount for the spool. Bind-mount sharing across
-  containers is not yet tested (see open questions).
+  anticipated — or a host bind mount for the spool. **A host bind mount was
+  measured after M5 and works**: two running containers saw the same directory,
+  a write from the rw holder was immediately visible to the ro holder, and a
+  write from the ro holder failed with `Read-only file system`. So the two-
+  service local stack keeps its shape, with the spool as a bind mount rather
+  than a named volume.
 
 ### D3 — `entrypoint` is one string, not an argv (forced)
 
@@ -537,6 +541,23 @@ It created an isolated network, a volume and two containers, waited for
 readiness, ran `ps --probe`, `exec`, `run` and `logs`, then `down --volumes`, and
 asserted all three resources were gone. It passed in 34.8 s, and the machine was
 left with no containers, no volumes, and only the `default` network.
+
+### Probes after M5 — what a local mitos slice can rely on
+
+The two runtime questions a two-service local stack had left were measured on
+2026-10-24, against `container` 1.6.0:
+
+- **Host bind mounts are shareable across running containers.** Two alpine
+  containers mounted one host directory, `:rw` and `:ro`. Both read the file;
+  a write from the rw container was visible to the ro container immediately;
+  a write from the ro container failed with `Read-only file system`. This is the
+  spool shape the local stack needs, and the fallback (one container running
+  both processes) is not required.
+- **`container build` works.** A trivial `Containerfile` (`FROM alpine` + one
+  `RUN`) built in 4.8 s and the tag was usable by `container run`; `image delete`
+  reclaimed it. BuildKit's `.dockerignore` handling was not measured — the
+  advice for the mitos image is a tiny build context (`image/` holding only the
+  Containerfile and the copied musl binaries) so it does not matter.
 
 ## Open questions
 

@@ -146,9 +146,23 @@ sudo container system dns create test
 
 The first step registers every container as `<name>.test` **inside** the
 runtime's DNS and configures containers to use it. The second writes
-`/etc/resolver/test` so macOS does too. Both are host setup; the tool does not
-perform either, but `plan` warns when the domain is unset and a stack declares
-aliases.
+`/etc/resolver/test` so macOS does too. Both are host setup; the tool performs
+neither. `plan` warns once when one service names another by container name and
+no domain is registered — the case where the omission otherwise looks like a
+broken service.
+
+Measured on 1.6.0 on 2026-10-24, in the order that matters:
+
+- `sudo container system dns create test` **alone is not enough**. The zone is
+  created — `container system dns list` lists it — but every container keeps a
+  single-label hostname and nothing resolves, including a container created
+  after the zone appeared.
+- Adding `[dns] domain = "test"` and restarting the system is what makes a name
+  resolvable. After it, both `midnight-lab-node.test` and the bare
+  `midnight-lab-node` resolved from a peer container on `default`.
+- Registration happens at **create** time. Containers created before the domain
+  was set still did not resolve after a restart; deleting and recreating them
+  did. `down` then `up`, not a stop and start.
 
 ### The custom-network gap
 
@@ -239,6 +253,24 @@ changed something:
 
 Every fixture used by tests is copied from a real run, never written from the
 docs. The adapter keeps the raw JSON under `--verbose`.
+
+Two more, from porting a real stack on 2026-10-24 (`container` 1.6.0, macOS
+27.0.1 arm64):
+
+- **Container-name DNS is off by default.** With `container system dns list`
+  empty — no `~/.config/container/config.toml`, and an empty `[dns]` in
+  `container system property list` — neither `<name>.test` nor the bare
+  `<name>` resolved, from a container on `default` or from one on a custom
+  network with a qualified alias. `container system dns create test` refuses
+  without an administrator (`cannot create domain (try sudo?)`). A container's
+  IP works. A stack that dials a service by name therefore depends on host
+  setup described above.
+- **A single-string `Cmd` is not run through a shell.** Each element of the
+  image's `Cmd` is exec'd literally, so an image whose `Cmd` is
+  `["/nix/store/…/midnight-proof-server --port $PORT"]` fails at start with
+  `failed to find target executable /nix/store/…/midnight-proof-server --port $PORT`.
+  `start` accepts a `Cmd` override, so the stack spells the shell out:
+  `command = ["/bin/sh", "-c", "midnight-proof-server --port $PORT"]`.
 
 ## Minimum surface the tool requires
 

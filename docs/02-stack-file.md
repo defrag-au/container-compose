@@ -79,16 +79,26 @@ best-effort parse.
 | `mode` | `"default"` or `"isolated"` | `"default"` | Attach to the runtime's `default` network, or create `<project>-net`. |
 | `subnet` | CIDR string | runtime-allocated | IPv4 subnet for `isolated`. Not valid with `mode = "default"`. |
 
-`default` is the default because it is the only network where container names
-resolve: `container` documents `<name>.test` lookups for containers on the
-`default` network, and documents that bare-hostname lookups on a custom network
-do not work yet (apple/container#1809). An `isolated` stack is isolated, but
-services inside it reach each other by IP or published port — `up` prints that
-constraint once rather than letting a service fail its first DNS lookup.
+`default` is the default because it is the only network where a container name
+can resolve at all. An `isolated` stack has no name resolution: services inside
+it reach each other by IP or published port, and `up` prints that constraint
+once rather than letting a service fail its first DNS lookup.
 
-Aliases (`services.<name>.aliases`) are passed as `--network ...,alias=<value>`
-and work on either mode to the extent the runtime supports them. An alias
-without a dot gets the configured DNS domain, exactly as the runtime documents.
+Resolution is **not** on out of the box. The runtime serves `<name>.test` only
+after a local DNS domain has been registered on the host, which needs admin; the
+setup is in [`04-runtime.md`](04-runtime.md#dns-is-a-two-step-setup). Measured
+on `container` 1.6.0 with no domain registered: neither `<name>.test` nor the
+bare `<name>` resolved, from the `default` network or a custom one, and a
+service that dialled a name failed after its reconnect budget. A stack that
+names its dependencies in env or argv therefore depends on host setup this tool
+does not perform — `plan` warns once when that setup is missing.
+
+Aliases (`services.<name>.aliases`) are passed as `--network ...,alias=<value>`.
+The runtime rejects a bare alias (`alpha`) unless a default DNS domain is
+configured, and a fully-qualified alias (`alpha.example.test`) still did not
+resolve between two containers on a custom network in 1.6.0
+(apple/container#1809). Until that changes, an alias is not a substitute for the
+container name.
 
 ## `[volumes.<name>]`
 

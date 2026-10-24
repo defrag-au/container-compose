@@ -126,6 +126,30 @@ fn a_fresh_stack_pulls_creates_and_starts() {
 }
 
 #[test]
+fn two_services_sharing_an_image_plan_one_pull() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         [services.a]\nimage = \"img\"\n\
+         [services.b]\nimage = \"img\"\n",
+    );
+    let plan = plan(&stack, &world());
+
+    let pulls = plan
+        .steps
+        .iter()
+        .filter(|step| step.action == Action::Pull)
+        .count();
+    assert_eq!(pulls, 1, "{:?}", actions(&plan));
+
+    let creates = plan
+        .steps
+        .iter()
+        .filter(|step| step.action == Action::Create)
+        .count();
+    assert_eq!(creates, 2, "deduping the pull must not drop a service");
+}
+
+#[test]
 fn a_matching_running_container_is_kept() {
     let stack = load("minimal");
     let mut world = world();
@@ -326,6 +350,87 @@ fn an_absent_isolated_network_is_created_and_warns_about_dns() {
         Detail::Note { message } => assert!(message.contains("apple/container#1809")),
         other => panic!("expected a note, got {other:?}"),
     }
+}
+
+/// A stack whose services dial each other by container name cannot work unless
+/// the host has a DNS domain registered, and the failure looks like a broken
+/// service rather than missing host setup.
+#[test]
+fn a_service_that_dials_another_by_name_warns_when_no_dns_domain_is_configured() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         [services.api]\nimage = \"img\"\n\
+         [services.worker]\nimage = \"img\"\n\
+         env = { PEER = \"ws://project-api:9944\" }\n",
+    );
+    let mut world = world();
+    with_image(&mut world, "img");
+
+    let plan = plan(&stack, &world);
+    assert!(plan.refusals.is_empty(), "{:?}", plan.refusals);
+
+    let warning = plan
+        .steps
+        .iter()
+        .find(|step| step.action == Action::Warn)
+        .expect("the DNS warning");
+    assert_eq!(warning.name, "project-worker");
+    match &warning.detail {
+        Detail::Note { message } => {
+            assert!(message.contains("`project-api`"), "{message}");
+            assert!(message.contains("[dns] domain"), "{message}");
+        }
+        other => panic!("expected a note, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_domain_qualified_name_counts_as_a_reference() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         [services.api]\nimage = \"img\"\n\
+         [services.worker]\nimage = \"img\"\n\
+         env = { PEER = \"ws://project-api.test:9944\" }\n",
+    );
+    let mut world = world();
+    with_image(&mut world, "img");
+
+    let plan = plan(&stack, &world);
+    assert!(
+        plan.steps.iter().any(|step| step.action == Action::Warn),
+        "a qualified name is still a name"
+    );
+}
+
+#[test]
+fn no_dns_warning_when_a_domain_is_registered() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         [services.api]\nimage = \"img\"\n\
+         [services.worker]\nimage = \"img\"\n\
+         env = { PEER = \"ws://project-api:9944\" }\n",
+    );
+    let mut world = world();
+    with_image(&mut world, "img");
+    world.dns_domains.push("test".to_owned());
+
+    let plan = plan(&stack, &world);
+    assert!(!plan.steps.iter().any(|step| step.action == Action::Warn));
+}
+
+#[test]
+fn a_longer_name_that_starts_with_anothers_is_not_a_reference() {
+    let (_dir, stack) = temp_stack(
+        "version = 1\n\
+         [services.api]\nimage = \"img\"\n\
+         [services.worker]\nimage = \"img\"\n\
+         env = { PEER = \"ws://project-api-2:9944\" }\n",
+    );
+    let mut world = world();
+    with_image(&mut world, "img");
+
+    let plan = plan(&stack, &world);
+    assert!(!plan.steps.iter().any(|step| step.action == Action::Warn));
 }
 
 #[test]

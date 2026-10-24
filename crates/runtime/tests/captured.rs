@@ -47,6 +47,19 @@ fn the_captured_runtime_is_running() {
     assert_eq!(status.status, "running");
 }
 
+/// The shape, not the contents: a re-capture on a host with no DNS domain
+/// registered legitimately yields `[]`.
+#[test]
+fn the_captured_dns_domains_are_a_list_of_names() {
+    let domains: Vec<String> = parse("dns-list.json");
+    assert!(
+        domains
+            .iter()
+            .all(|domain| !domain.is_empty() && !domain.contains(' ')),
+        "{domains:?}"
+    );
+}
+
 #[test]
 fn the_captured_containers_parse_and_keep_their_labels() {
     let containers: Vec<ObservedContainer> = parse("container-list.json");

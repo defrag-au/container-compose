@@ -190,6 +190,7 @@ fn dispatch(args: &[String], world: &mut World) -> Result<(), Failure> {
         "system" => match rest.first().map(String::as_str) {
             Some("status") => system_status(&rest[1..]),
             Some("version") => system_version(&rest[1..]),
+            Some("dns") => system_dns(&rest[1..], world),
             _ => Err(Failure::usage("unknown `system` subcommand")),
         },
         other => Err(Failure::usage(format!("unknown command `{other}`"))),
@@ -788,6 +789,17 @@ fn system_status(args: &[String]) -> Result<(), Failure> {
         return Err(Failure::usage("system status takes no arguments"));
     }
     println!(r#"{{"status":"running"}}"#);
+    Ok(())
+}
+
+fn system_dns(args: &[String], world: &World) -> Result<(), Failure> {
+    let parsed = parse(args, &["--format"], &["--quiet", "--debug"])?;
+    match parsed.positionals.as_slice() {
+        [command] if command == "list" || command == "ls" => {}
+        _ => return Err(Failure::usage("`system dns` takes `list`")),
+    }
+    let json = serde_json::to_string(&world.observed.dns_domains).expect("json");
+    println!("{json}");
     Ok(())
 }
 

@@ -1321,6 +1321,34 @@ fn an_isolated_network_is_created_and_removed_by_down() {
     );
 }
 
+const DIALS_BY_NAME: &str = r#"version = 1
+name = "dial"
+[services.api]
+image = "docker.io/library/alpine:latest"
+[services.worker]
+image = "docker.io/library/alpine:latest"
+env = { PEER = "ws://dial-api:9944" }
+"#;
+
+/// The failure this catches is a service that cannot resolve its dependency;
+/// without the warning it reads as a broken image.
+#[test]
+fn plan_warns_when_a_service_dials_another_and_no_dns_domain_is_configured() {
+    let fake = Fake::new();
+    let dir = TempDir::new().expect("temp dir");
+    let path = stack_file(&dir, DIALS_BY_NAME);
+
+    let plan = fake
+        .command(&["-f", path.to_str().expect("utf-8"), "plan"])
+        .output()
+        .expect("runs");
+    assert!(plan.status.success(), "stderr: {}", stderr(&plan));
+
+    let table = String::from_utf8_lossy(&plan.stdout);
+    assert!(table.contains("dial-api"), "{table}");
+    assert!(table.contains("[dns] domain"), "{table}");
+}
+
 #[test]
 fn exec_runs_in_a_running_service_and_refuses_a_stopped_one() {
     let fake = Fake::new();

@@ -3,6 +3,8 @@
 #
 # container system status --format json  -> system-status.json
 # container system version --format json -> system-version.json
+# container system dns list --format json -> dns-list.json (captured separately the same
+#   day, on a host with the `test` domain registered; a fresh host yields [])
 # container list --all --format json     -> container-list.json
 # container inspect ccfixtures-31236-api ccfixtures-31236-worker -> container-inspect.json
 # container volume list --format json    -> volume-list.json

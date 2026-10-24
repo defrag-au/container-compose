@@ -1,6 +1,6 @@
 //! The plan itself.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use container_compose_runtime::{argv, labels, Observed};
 use container_compose_stack::model::{NetworkMode, PullPolicy};
@@ -256,6 +256,7 @@ pub fn plan_with(stack: &ResolvedStack, observed: &Observed, options: &Options) 
         ));
     }
 
+    plan_dns(stack, observed, &mut warnings);
     plan_orphans(stack, observed, &mut warnings);
     steps.extend(warnings);
 
@@ -274,6 +275,10 @@ fn plan_images(
     steps: &mut Vec<Step>,
     refusals: &mut Vec<Refusal>,
 ) {
+    // One pull per image, not one per service: a stack that shares an image
+    // between services should not show two identical rows.
+    let mut pulled: BTreeSet<&str> = BTreeSet::new();
+
     for name in &stack.order {
         let service = stack
             .services
@@ -311,7 +316,7 @@ fn plan_images(
             }
         };
 
-        if pull {
+        if pull && pulled.insert(service.image.as_str()) {
             steps.push(Step::new(
                 Action::Pull,
                 Resource::Image,
@@ -547,6 +552,77 @@ fn plan_orphans(stack: &ResolvedStack, observed: &Observed, warnings: &mut Vec<S
             )),
         }
     }
+}
+
+fn plan_dns(stack: &ResolvedStack, observed: &Observed, warnings: &mut Vec<Step>) {
+    if !observed.dns_domains.is_empty() {
+        return;
+    }
+
+    for (declared, service) in &stack.services {
+        for (other, target) in &stack.services {
+            if declared == other {
+                continue;
+            }
+            let name = argv::container_name(&stack.name, &target.name);
+            if !mentions(service, &name) {
+                continue;
+            }
+            // One warning, not one per pair: the advice is the same and the
+            // table should stay readable.
+            warnings.push(Step::new(
+                Action::Warn,
+                Resource::Container,
+                argv::container_name(&stack.name, &service.name),
+                Detail::Note {
+                    message: format!(
+                        "`{declared}` refers to `{name}` by name, but no container DNS domain \
+                         is configured, so it will not resolve. Register one once on the host \
+                         — `[dns] domain` in ~/.config/container/config.toml, a system restart, \
+                         and `sudo container system dns create <domain>` — then recreate the \
+                         containers (docs/04-runtime.md)"
+                    ),
+                },
+                None,
+            ));
+            return;
+        }
+    }
+}
+
+/// Whether a service names `target` in something the container will read.
+fn mentions(service: &ResolvedService, target: &str) -> bool {
+    let probe = service
+        .healthcheck
+        .iter()
+        .flat_map(|healthcheck| healthcheck.exec.iter());
+
+    service
+        .command
+        .iter()
+        .flatten()
+        .chain(service.entrypoint.iter())
+        .chain(service.env.values())
+        .chain(probe)
+        .any(|value| names_token(value, target))
+}
+
+/// A whole-token match, so `midnight-lab-node.test` counts and
+/// `midnight-lab-node-2` does not.
+fn names_token(value: &str, target: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_alphanumeric()
+                || character == '-'
+                || character == '_'
+                || character == '.')
+        })
+        .any(|token| {
+            token == target
+                || token
+                    .strip_prefix(target)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
 }
 
 fn create_step(stack: &ResolvedStack, service: &ResolvedService, container_name: &str) -> Step {

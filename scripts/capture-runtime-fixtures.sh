@@ -95,6 +95,7 @@ done
 
 "$CONTAINER" system status --format json >"$OUT/system-status.json"
 "$CONTAINER" system version --format json >"$OUT/system-version.json"
+"$CONTAINER" system dns list --format json >"$OUT/dns-list.json"
 "$CONTAINER" list --all --format json >"$OUT/container-list.json"
 "$CONTAINER" inspect "$API" "$WORKER" >"$OUT/container-inspect.json"
 "$CONTAINER" volume list --format json >"$OUT/volume-list.json"
@@ -109,6 +110,7 @@ done
     printf '#\n'
     printf '# container system status --format json  -> system-status.json\n'
     printf '# container system version --format json -> system-version.json\n'
+    printf '# container system dns list --format json -> dns-list.json\n'
     printf '# container list --all --format json     -> container-list.json\n'
     printf '# container inspect %s %s -> container-inspect.json\n' "$API" "$WORKER"
     printf '# container volume list --format json    -> volume-list.json\n'
