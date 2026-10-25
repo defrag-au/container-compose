@@ -1,0 +1,25 @@
+{
+  "id": "urn:skill:container-compose",
+  "type": "https://ocfl.io/1.1/spec/#inventory",
+  "digestAlgorithm": "sha512",
+  "head": "v1",
+  "manifest": {
+    "2f3153f9217046648dd7a486d7a05d5f0c511fed117ef647821e0e37a0444df48e0699b6eb6dd62403f9c3aa608b6ba4816a225656b119627d9c0f92b97e04cd": [
+      "v1/content/SKILL.md"
+    ]
+  },
+  "versions": {
+    "v1": {
+      "created": "2026-10-25T05:53:06Z",
+      "state": {
+        "2f3153f9217046648dd7a486d7a05d5f0c511fed117ef647821e0e37a0444df48e0699b6eb6dd62403f9c3aa608b6ba4816a225656b119627d9c0f92b97e04cd": [
+          "SKILL.md"
+        ]
+      },
+      "message": "first published version",
+      "user": {
+        "name": "damo"
+      }
+    }
+  }
+}
