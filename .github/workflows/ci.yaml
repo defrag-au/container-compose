@@ -35,7 +35,6 @@ jobs:
   # formatting miss never spends a runner slot on clippy or the suite.
   fmt:
     name: Fmt
-    runs-on: [self-hosted, netcup-arm]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +52,6 @@ jobs:
   clippy:
     name: Clippy
     needs: [fmt]
-    runs-on: [self-hosted, netcup-arm]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -73,7 +71,6 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: [self-hosted, netcup-arm]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
