@@ -1,3 +1,6 @@
 .direnv/
 .tmp/
 /target/
+
+# `playbook skills sync` development override — a machine path, never committed
+.playbook/skills.patch

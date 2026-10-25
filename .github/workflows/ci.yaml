@@ -31,6 +31,14 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  # An edit under `skills/` that was never published is an edit no consumer can see: an OCFL
+  # version is immutable, so the published object is still the old one. `skill-store status` fails
+  # on that, and on a skill directory with no object. Fix a red run with `skill-store
+  # publish-changed --store .skill-store --worktree skills`, committed with the edit.
+  skills:
+    name: Skills
+    uses: defrag-au/agent-playbook/.github/workflows/skills-check.yaml@main
+
   # Fast-fail gate. fmt is seconds; the heavier jobs wait for it, so a
   # formatting miss never spends a runner slot on clippy or the suite.
   fmt:
