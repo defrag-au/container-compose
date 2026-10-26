@@ -103,6 +103,9 @@ done
 "$CONTAINER" network list --format json >"$OUT/network-list.json"
 "$CONTAINER" image list --format json >"$OUT/image-list.json"
 "$CONTAINER" logs "$API" >"$OUT/logs-api.txt"
+# Takes two samples two seconds apart before printing. Only running containers
+# appear, and a container whose statistics call fails is silently left out.
+"$CONTAINER" stats --no-stream --format json "$API" >"$OUT/container-stats.json"
 
 {
     printf '# Captured %s by scripts/capture-runtime-fixtures.sh\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -118,6 +121,7 @@ done
     printf '# container network list --format json   -> network-list.json\n'
     printf '# container image list --format json     -> image-list.json\n'
     printf '# container logs %s -> logs-api.txt\n' "$API"
+    printf '# container stats --no-stream --format json %s -> container-stats.json\n' "$API"
 } >"$OUT/capture.txt"
 
 printf 'captured into %s\n' "$OUT"

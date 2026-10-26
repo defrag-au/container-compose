@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use container_compose_runtime::{
-    ObservedContainer, ObservedImage, ObservedNetwork, ObservedVolume,
+    ObservedContainer, ObservedImage, ObservedNetwork, ObservedStats, ObservedVolume,
 };
 use serde::Deserialize;
 
@@ -160,4 +160,17 @@ fn the_captured_images_parse() {
         .find(|image| image.configuration.name == "docker.io/library/alpine:latest")
         .expect("the image the capture used");
     assert!(!alpine.id.is_empty());
+}
+
+#[test]
+fn the_captured_stats_parse() {
+    let stats: Vec<ObservedStats> = parse("container-stats.json");
+    let node = stats
+        .iter()
+        .find(|reading| reading.id == "midnight-lab-node")
+        .expect("the node's reading");
+    assert!(node.cpu_usage_usec > 0, "cumulative CPU time is reported");
+    assert!(node.memory_usage_bytes > 0);
+    assert_eq!(node.memory_limit_bytes, 1024 * 1024 * 1024);
+    assert!(node.num_processes > 0);
 }

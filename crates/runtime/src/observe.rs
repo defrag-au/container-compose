@@ -156,6 +156,47 @@ pub fn observe(program: &str) -> Result<Observed, RuntimeError> {
     })
 }
 
+/// One container's resource counters from `container stats --format json`.
+///
+/// CPU, network and block I/O are cumulative since the container started, so a
+/// rate is a difference between two readings; memory and processes are
+/// instantaneous. The shape is `fixtures/real/container-stats.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedStats {
+    pub id: String,
+    #[serde(default)]
+    pub cpu_usage_usec: u64,
+    #[serde(default)]
+    pub memory_usage_bytes: u64,
+    #[serde(default)]
+    pub memory_limit_bytes: u64,
+    #[serde(default)]
+    pub network_rx_bytes: u64,
+    #[serde(default)]
+    pub network_tx_bytes: u64,
+    #[serde(default)]
+    pub block_read_bytes: u64,
+    #[serde(default)]
+    pub block_write_bytes: u64,
+    #[serde(default)]
+    pub num_processes: u64,
+}
+
+/// `stats --no-stream`, for every running container, parsed.
+///
+/// No container ids are passed: naming one that is not running fails the whole
+/// call, and the caller filters by name anyway. The runtime takes two samples
+/// two seconds apart before printing, so this blocks for at least that long.
+/// A container whose statistics call fails inside the runtime is left out
+/// rather than reported, so absence means "no reading", not zero.
+pub fn stats(program: &str) -> Result<Vec<ObservedStats>, RuntimeError> {
+    parse(
+        "`container stats`",
+        &run(program, &["stats", "--no-stream", "--format", "json"])?,
+    )
+}
+
 /// `list --all`, parsed. The start phase polls this rather than calling the
 /// full `observe`, which is four more subprocesses per poll.
 pub fn containers(program: &str) -> Result<Vec<ObservedContainer>, RuntimeError> {

@@ -72,6 +72,7 @@ impl Fake {
             )
             .env("FAKE_CONTAINER_DIR", &self.world)
             .env("CONTAINER_COMPOSE_CACHE_DIR", &self.cache)
+            .env("CONTAINER_COMPOSE_HISTORY_DIR", self.cache.join("history"))
             .args(args);
         command
     }

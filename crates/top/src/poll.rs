@@ -6,6 +6,7 @@
 //! request sender ends the worker.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use container_compose_runtime::{argv, observe, probe, Command, ObservedContainer, Probe};
 use container_compose_supervisor::cache::{self, HealthCache};
 use container_compose_supervisor::clock;
+use container_compose_supervisor::history::{self, Sample};
 
 /// Where to look, and how often.
 #[derive(Debug, Clone)]
@@ -25,7 +27,16 @@ pub struct Source {
     pub interval: Duration,
     /// Log lines fetched for the selected service.
     pub log_lines: u32,
+    /// The supervisor's resource history for this project, if there is a home
+    /// directory to find it in.
+    pub history: Option<PathBuf>,
 }
+
+/// The history changes every 30 seconds, so re-reading it every poll is waste.
+const HISTORY_EVERY: Duration = Duration::from_secs(10);
+/// Enough of the file's end for the trend window: an hour of 30-second samples
+/// is 120 lines, a few hundred bytes each for a handful of services.
+const HISTORY_TAIL_BYTES: u64 = 512 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -50,6 +61,8 @@ pub struct Snapshot {
     /// The health cache, only when [`cache::live`] trusts it.
     pub cache: Option<HealthCache>,
     pub logs: Option<Logs>,
+    /// The recent history, when this poll re-read it; `None` keeps the last.
+    pub history: Option<Vec<Sample>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +82,7 @@ pub fn spawn(source: Source) -> (Sender<Request>, Receiver<Update>) {
 fn work(source: &Source, inbox: &Receiver<Request>, outbox: &Sender<Update>) {
     let mut selected: Option<String> = None;
     let mut due = Instant::now();
+    let mut history_read: Option<Instant> = None;
     loop {
         match inbox.recv_timeout(due.saturating_duration_since(Instant::now())) {
             Ok(Request::Select(service)) => {
@@ -91,7 +105,17 @@ fn work(source: &Source, inbox: &Receiver<Request>, outbox: &Sender<Update>) {
             Err(RecvTimeoutError::Disconnected) => return,
         }
 
-        let snapshot = capture(source, selected.as_deref());
+        let mut snapshot = capture(source, selected.as_deref());
+        if history_read.is_none_or(|at| at.elapsed() >= HISTORY_EVERY) {
+            snapshot.history = Some(
+                source
+                    .history
+                    .as_deref()
+                    .map(|path| history::read_tail_at(path, HISTORY_TAIL_BYTES))
+                    .unwrap_or_default(),
+            );
+            history_read = Some(Instant::now());
+        }
         if outbox.send(Update::Snapshot(snapshot)).is_err() {
             return;
         }
@@ -120,6 +144,7 @@ fn capture(source: &Source, selected: Option<&str>) -> Snapshot {
         containers,
         cache,
         logs,
+        history: None,
     }
 }
 

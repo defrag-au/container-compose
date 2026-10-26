@@ -53,7 +53,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_services(frame: &mut Frame, area: Rect, app: &mut App) {
     let header = TableRow::new([
-        "SERVICE", "STATE", "HEALTH", "UPTIME", "RESTARTS", "POLICY", "PORTS", "IMAGE",
+        "SERVICE", "STATE", "HEALTH", "UPTIME", "RESTARTS", "CPU", "CPU 1h", "MEMORY", "MEM 1h",
+        "PORTS",
     ])
     .style(Style::new().bold());
 
@@ -61,13 +62,16 @@ fn draw_services(frame: &mut Frame, area: Rect, app: &mut App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(14),
+            Constraint::Length(12),
             Constraint::Length(11),
-            Constraint::Length(10),
+            Constraint::Length(9),
             Constraint::Length(8),
-            Constraint::Length(10),
             Constraint::Length(8),
-            Constraint::Length(24),
+            Constraint::Length(6),
+            Constraint::Length(12),
+            // `317 MiB / 1.0 GiB`
+            Constraint::Length(17),
+            Constraint::Length(12),
             Constraint::Fill(1),
         ],
     )
@@ -112,15 +116,18 @@ fn service_row(row: &Row) -> TableRow<'static> {
         (0, false) => Cell::from("0").dark_gray(),
         (count, false) => Cell::from(count.to_string()).yellow(),
     };
+    let dash = || "—".to_owned();
     TableRow::new([
         Cell::from(row.service.clone()).bold(),
         Cell::from(row.state.clone()).style(state_style),
         Cell::from(row.health.clone()).style(health_style),
-        Cell::from(row.uptime.clone().unwrap_or_else(|| "—".to_owned())),
+        Cell::from(row.uptime.clone().unwrap_or_else(dash)),
         restarts,
-        Cell::from(row.policy.clone().unwrap_or_else(|| "—".to_owned())),
+        Cell::from(row.usage.cpu.clone().unwrap_or_else(dash)),
+        Cell::from(row.usage.cpu_trend.clone()).cyan(),
+        Cell::from(row.usage.mem.clone().unwrap_or_else(dash)),
+        Cell::from(row.usage.mem_trend.clone()).magenta(),
         Cell::from(row.ports.join(", ")),
-        Cell::from(row.image.clone().unwrap_or_default()).dark_gray(),
     ])
 }
 
@@ -148,15 +155,29 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_logs(frame: &mut Frame, area: Rect, app: &App) {
     let service = app.selected_service().unwrap_or("");
+    let row = app.rows.iter().find(|row| row.service == service);
+    // The table has no room for these; the selected service's pane does.
+    let details: String = row
+        .into_iter()
+        .flat_map(|row| {
+            [
+                row.image.clone(),
+                row.policy
+                    .as_ref()
+                    .map(|policy| format!("restart {policy}")),
+            ]
+        })
+        .flatten()
+        .map(|detail| format!(" · {detail}"))
+        .collect();
     let scrolled = if app.log_scroll > 0 {
         format!(" · {} lines up", app.log_scroll)
     } else {
         String::new()
     };
-    let block = Block::bordered().title(format!(" logs · {service}{scrolled} "));
+    let block = Block::bordered().title(format!(" logs · {service}{details}{scrolled} "));
 
     let Some(logs) = &app.logs else {
-        let row = app.rows.iter().find(|row| row.service == service);
         let message = match row {
             Some(row) if row.container.is_none() => "the container has not been created",
             Some(_) => "fetching…",
@@ -199,8 +220,10 @@ mod tests {
     use crate::model::Declared;
     use crate::poll::{Logs, Snapshot, Update};
     use container_compose_runtime::ObservedContainer;
+    use container_compose_supervisor::history::{Reading, Sample};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::collections::BTreeMap;
 
     fn captured() -> Vec<ObservedContainer> {
         let text = std::fs::read_to_string(concat!(
@@ -237,6 +260,7 @@ mod tests {
             containers: Ok(captured()),
             cache: None,
             logs: None,
+            history: None,
         }));
         app.apply(Update::Snapshot(Snapshot {
             at_secs: 1_792_830_353,
@@ -247,8 +271,28 @@ mod tests {
                 lines: vec!["capture-hello".to_owned()],
                 error: None,
             }),
+            history: Some(history_for_api(1_792_830_353)),
         }));
         app
+    }
+
+    /// Two readings of `api`, 30 s apart, ending just before `now`: 3 s of
+    /// CPU in the interval, 64 MiB of a 1 GiB limit.
+    fn history_for_api(now: u64) -> Vec<Sample> {
+        let reading = |cpu_usec: u64| Reading {
+            started: Some("2026-10-24T04:25:54Z".to_owned()),
+            cpu_usec,
+            mem: 64 << 20,
+            mem_limit: 1 << 30,
+            ..Reading::default()
+        };
+        [(now - 40, 1_000_000), (now - 10, 4_000_000)]
+            .into_iter()
+            .map(|(at, cpu_usec)| Sample {
+                at,
+                services: BTreeMap::from([("api".to_owned(), reading(cpu_usec))]),
+            })
+            .collect()
     }
 
     #[test]
@@ -266,6 +310,26 @@ mod tests {
         assert!(text.contains("logs · api"));
         assert!(text.contains("capture-hello"));
         assert!(text.contains("q quit"));
+    }
+
+    #[test]
+    fn usage_from_the_history_fills_the_cpu_and_memory_columns() {
+        let mut app = app_with_logs();
+        let text = screen(&mut app, 130, 24);
+        println!("{text}");
+
+        let api = text
+            .lines()
+            .find(|line| line.contains("▶ api"))
+            .expect("the api row");
+        assert!(api.contains("10%"), "3 s of CPU in 30 s: {api}");
+        assert!(api.contains("64 MiB / 1.0 GiB"), "{api}");
+        let worker = text.lines().find(|line| line.contains("worker")).unwrap();
+        assert!(!worker.contains("MiB"), "no readings, no usage: {worker}");
+        assert!(
+            text.contains("docker.io/library/alpine:latest"),
+            "image in the logs title"
+        );
     }
 
     #[test]

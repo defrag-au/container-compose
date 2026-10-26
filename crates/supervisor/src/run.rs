@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -18,6 +18,8 @@ use container_compose_stack::resolve::{ResolvedHealthcheck, ResolvedStack};
 
 use crate::cache::{self, CachedHealth, HealthCache};
 use crate::clock;
+use crate::history;
+use crate::sampler::Sampler;
 use crate::tick::{Action, ProbeOutcome, ServiceSpec, Supervisor, Update, View};
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,8 @@ pub struct Options {
     /// The first interrupt leaves everything running.
     pub no_stop_on_exit: bool,
     pub verbose: bool,
+    /// How often to record resource usage to the history; `None` records none.
+    pub sample_interval: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -103,7 +107,25 @@ pub fn run(
             .collect(),
     );
     let start = Instant::now();
-    let mut history: BTreeMap<String, History> = BTreeMap::new();
+    let mut records: BTreeMap<String, History> = BTreeMap::new();
+
+    let (warnings_tx, warnings) = mpsc::channel::<String>();
+    if let (Some(interval), Some(path)) = (options.sample_interval, history::path(&stack.name)) {
+        Sampler {
+            runtime: options.runtime.clone(),
+            path,
+            containers: services
+                .iter()
+                .map(|service| (argv::container_name(&stack.name, service), service.clone()))
+                .collect(),
+            interval,
+            interrupts: interrupts.clone(),
+            warnings: warnings_tx,
+        }
+        // Not joined: it checks the interrupt counter every 100 ms, and a
+        // sample it appends while the services stop is harmless.
+        .spawn();
+    }
 
     writeln!(
         out,
@@ -111,11 +133,14 @@ pub fn run(
         services.len(),
         if services.len() == 1 { "" } else { "s" }
     )?;
-    publish(stack, &supervisor, &history, out);
+    publish(stack, &supervisor, &records, out);
 
     loop {
         if interrupted(&interrupts) {
             break;
+        }
+        while let Ok(warning) = warnings.try_recv() {
+            let _ = writeln!(out, "warning: {warning}");
         }
 
         let now_ms = elapsed(start);
@@ -157,13 +182,13 @@ pub fn run(
                         "give up  {service}  after {attempts} restart{}",
                         if attempts == 1 { "" } else { "s" }
                     );
-                    history.entry(service).or_default().gave_up = true;
+                    records.entry(service).or_default().gave_up = true;
                     cache_dirty = true;
                 }
                 Action::Restart { service, attempt } => {
                     let name = argv::container_name(&stack.name, &service);
                     let _ = writeln!(out, "restart  {name}  attempt {attempt}");
-                    let record = history.entry(service).or_default();
+                    let record = records.entry(service).or_default();
                     record.restarts = record.restarts.saturating_add(1);
                     record.last_restart_at =
                         Some(clock::format_rfc3339_seconds(clock::wall_ms() / 1_000));
@@ -200,7 +225,7 @@ pub fn run(
         }
 
         if cache_dirty {
-            publish(stack, &supervisor, &history, out);
+            publish(stack, &supervisor, &records, out);
         }
         sleep(options.poll_interval, &interrupts);
     }
@@ -281,7 +306,7 @@ fn views_for(
 fn publish(
     stack: &ResolvedStack,
     supervisor: &Supervisor,
-    history: &BTreeMap<String, History>,
+    records: &BTreeMap<String, History>,
     out: &mut dyn Write,
 ) {
     let services = supervisor
@@ -291,7 +316,7 @@ fn publish(
             let checked_at = supervisor
                 .checked_at(&name)
                 .map(|millis| clock::format_rfc3339_seconds(millis / 1_000));
-            let record = history.get(&name).cloned().unwrap_or_default();
+            let record = records.get(&name).cloned().unwrap_or_default();
             (
                 name,
                 CachedHealth {

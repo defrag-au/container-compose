@@ -25,6 +25,7 @@ use container_compose_stack::resolve::{
 use container_compose_stack::{self as stack, Options};
 use container_compose_supervisor::cache;
 use container_compose_supervisor::clock;
+use container_compose_supervisor::history;
 use container_compose_supervisor::lock::{self, LockError};
 use container_compose_supervisor::{
     run as supervise, Options as SupervisorOptions, SupervisorError,
@@ -192,6 +193,15 @@ pub enum Command {
         #[arg(short = 'n', long, default_value = "200")]
         lines: u32,
     },
+    /// Resource usage per service over a window, from the supervisor's history.
+    Stats {
+        /// How far back to summarise; the history keeps seven days.
+        #[arg(long, default_value = "1h", value_parser = parse_span)]
+        since: Span,
+        /// Emit the machine-readable document.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a service's logs.
     Logs {
         /// Services to show; default is all.
@@ -238,6 +248,7 @@ pub fn run(cli: Cli) -> Result<(), Error> {
         } => down_command(&cli, *volumes, *timeout, *dry_run),
         Command::Ps { json, probe } => ps_command(&cli, *json, *probe),
         Command::Top { interval, lines } => top_command(&cli, *interval, *lines),
+        Command::Stats { since, json } => stats_command(&cli, *since, *json),
         Command::Logs {
             services,
             follow,
@@ -396,6 +407,7 @@ fn up_command(cli: &Cli, flags: &UpFlags<'_>) -> Result<(), Error> {
         stop_timeout: timeout_secs(flags.timeout),
         no_stop_on_exit: flags.no_stop_on_exit,
         verbose: cli.verbose,
+        sample_interval: Some(container_compose_supervisor::history::SAMPLE_INTERVAL),
     };
     supervise(
         &stack,
@@ -573,6 +585,204 @@ fn top_command(cli: &Cli, interval: Span, lines: u32) -> Result<(), Error> {
         log_lines: lines,
     })
     .map_err(|error| Error::Runtime(error.to_string()))
+}
+
+#[derive(Debug, Serialize)]
+struct StatsDocument {
+    project: String,
+    since_secs: u64,
+    samples: usize,
+    first_at: Option<String>,
+    last_at: Option<String>,
+    /// Intervals between samples longer than two sampling periods: times no
+    /// supervisor was running, or the runtime gave no readings.
+    gaps: usize,
+    services: Vec<history::Summary>,
+}
+
+fn stats_command(cli: &Cli, since: Span, json: bool) -> Result<(), Error> {
+    // Like `ps`, the stack file only orders the rows; history outlives it.
+    let stack = if cli.file.exists() {
+        Some(stack::load(
+            &cli.file,
+            &Options {
+                project_name: cli.project_name.clone(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let project = stack
+        .as_ref()
+        .map(|stack| stack.name.clone())
+        .unwrap_or_else(|| project_from_path(cli));
+    let path = history::path(&project).ok_or_else(|| {
+        Error::Internal(format!(
+            "neither {} nor HOME is set",
+            history::HISTORY_DIR_ENV
+        ))
+    })?;
+
+    let since_secs = u64::try_from(since.millis() / 1_000).unwrap_or(u64::MAX);
+    let cutoff = (clock::wall_ms() / 1_000).saturating_sub(since_secs);
+    let samples: Vec<history::Sample> = history::read_at(&path)
+        .into_iter()
+        .filter(|sample| sample.at >= cutoff)
+        .collect();
+
+    // Declared services in start order, then anything else the history holds.
+    let mut services: Vec<String> = stack
+        .as_ref()
+        .map(|stack| stack.order.clone())
+        .unwrap_or_default();
+    let mut recorded: Vec<String> = samples
+        .iter()
+        .flat_map(|sample| sample.services.keys().cloned())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|service| !services.contains(service))
+        .collect();
+    services.append(&mut recorded);
+
+    let gap_secs = 2 * history::SAMPLE_INTERVAL.as_secs();
+    let document = StatsDocument {
+        project: project.clone(),
+        since_secs,
+        samples: samples.len(),
+        first_at: samples
+            .first()
+            .map(|sample| clock::format_rfc3339_seconds(sample.at)),
+        last_at: samples
+            .last()
+            .map(|sample| clock::format_rfc3339_seconds(sample.at)),
+        gaps: samples
+            .windows(2)
+            .filter(|pair| pair[1].at.saturating_sub(pair[0].at) > gap_secs)
+            .count(),
+        services: services
+            .iter()
+            .filter_map(|service| history::summarize(&samples, service))
+            .collect(),
+    };
+
+    if json {
+        let rendered = serde_json::to_string_pretty(&document)
+            .map_err(|error| Error::Internal(format!("cannot render stats: {error}")))?;
+        println!("{rendered}");
+        return Ok(());
+    }
+    print!("{}", render_stats(&document, &services, since));
+    Ok(())
+}
+
+fn render_stats(document: &StatsDocument, services: &[String], since: Span) -> String {
+    let window = render_span(since);
+    let (Some(first), Some(last)) = (&document.first_at, &document.last_at) else {
+        return format!(
+            "no history for {} in the last {window}. A supervisor records a sample every {}s \
+             while `up` runs.\n",
+            document.project,
+            history::SAMPLE_INTERVAL.as_secs()
+        );
+    };
+
+    let gaps = match document.gaps {
+        0 => String::new(),
+        1 => ", 1 gap".to_owned(),
+        count => format!(", {count} gaps"),
+    };
+    let mut out = format!(
+        "{} · last {window} · {} samples from {first} to {last}{gaps}\n\n",
+        document.project, document.samples
+    );
+
+    let pct = |value: Option<f64>| value.map_or_else(|| "—".to_owned(), history::format_pct);
+    let mut rows: Vec<Vec<String>> = vec![[
+        "SERVICE",
+        "READINGS",
+        "CPU AVG",
+        "CPU PEAK",
+        "MEM AVG",
+        "MEM PEAK",
+        "LIMIT",
+        "NET IN",
+        "NET OUT",
+        "DISK READ",
+        "DISK WRITE",
+        "RESTARTS",
+    ]
+    .map(str::to_owned)
+    .to_vec()];
+    for service in services {
+        let row = match document
+            .services
+            .iter()
+            .find(|summary| &summary.service == service)
+        {
+            Some(summary) => vec![
+                service.clone(),
+                summary.readings.to_string(),
+                pct(summary.cpu_avg_pct),
+                pct(summary.cpu_peak_pct),
+                history::format_bytes(summary.mem_avg),
+                history::format_bytes(summary.mem_peak),
+                history::format_bytes(summary.mem_limit),
+                history::format_bytes(summary.net_rx),
+                history::format_bytes(summary.net_tx),
+                history::format_bytes(summary.blk_read),
+                history::format_bytes(summary.blk_write),
+                summary.restarts.to_string(),
+            ],
+            None => {
+                let mut row = vec![service.clone(), "0".to_owned()];
+                row.extend(std::iter::repeat_n("—".to_owned(), 10));
+                row
+            }
+        };
+        rows.push(row);
+    }
+    out.push_str(&render_columns(&rows));
+    out
+}
+
+/// Left-aligned columns two spaces apart; the last column is not padded.
+fn render_columns(rows: &[Vec<String>]) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..columns)
+        .map(|index| {
+            rows.iter()
+                .filter_map(|row| row.get(index))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            out.push_str(cell);
+            if index + 1 < row.len() {
+                let padding = widths[index].saturating_sub(cell.chars().count()) + 2;
+                out.push_str(&" ".repeat(padding));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `1h`, `90m`, `7d`, `45s`: the largest whole unit.
+fn render_span(span: Span) -> String {
+    let seconds = u64::try_from(span.millis() / 1_000).unwrap_or(u64::MAX);
+    if seconds % 86_400 == 0 && seconds > 0 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds % 3_600 == 0 && seconds > 0 {
+        format!("{}h", seconds / 3_600)
+    } else if seconds % 60 == 0 && seconds > 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 struct TerminalFlags {

@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 
+use container_compose_supervisor::history::Sample;
+
 use crate::model::{self, Declared, Event, Row};
 use crate::poll::{Logs, Request, Snapshot, Update};
 
@@ -29,6 +31,8 @@ pub struct App {
     pub updated_at: Option<String>,
     /// The last on-demand probe, shown in the footer.
     pub note: Option<String>,
+    /// The recent resource history, as last read.
+    pub samples: Vec<Sample>,
     pub quit: bool,
     polled: bool,
 }
@@ -46,6 +50,7 @@ impl App {
             supervisor_pid: None,
             updated_at: None,
             note: None,
+            samples: Vec::new(),
             quit: false,
             polled: false,
         }
@@ -72,6 +77,9 @@ impl App {
         let before = self.selected_service().map(str::to_owned);
         self.updated_at = Some(model::clock_of_day(snapshot.at_secs));
         self.supervisor_pid = snapshot.cache.as_ref().map(|cache| cache.pid);
+        if let Some(samples) = snapshot.history {
+            self.samples = samples;
+        }
 
         match snapshot.containers {
             Ok(containers) => {
@@ -80,6 +88,7 @@ impl App {
                     &self.declared,
                     &containers,
                     snapshot.cache.as_ref(),
+                    &self.samples,
                     snapshot.at_secs,
                 );
                 // The first poll is the baseline, not a burst of "appeared".
@@ -196,6 +205,7 @@ mod tests {
             containers: Ok(containers),
             cache: None,
             logs,
+            history: None,
         })
     }
 
@@ -235,6 +245,7 @@ mod tests {
             containers: Err("`container list` exited with 1".to_owned()),
             cache: None,
             logs: None,
+            history: None,
         }));
         assert_eq!(app.rows.len(), 2);
         assert!(app.runtime_error.is_some());

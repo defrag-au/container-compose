@@ -73,6 +73,7 @@ impl Smoke {
     fn command(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_container-compose"))
             .env("CONTAINER_COMPOSE_CACHE_DIR", &self.cache)
+            .env("CONTAINER_COMPOSE_HISTORY_DIR", self.cache.join("history"))
             .args([
                 "-f",
                 self.stack.to_str().expect("utf-8"),

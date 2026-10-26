@@ -218,7 +218,16 @@ cache — `~/Library/Caches/container-compose/<project>.json`, holding its pid a
 the last result per service, with the restarts it has issued for each and whether
 it gave up — and `ps` and `top` read it. The restart count is history for a
 reader and never resets; the tick's attempt counter, which does reset after 60 s
-of healthy uptime, stays in memory. A missing file, a pid that is
+of healthy uptime, stays in memory.
+
+Resource use is the other thing only a running supervisor sees over time. A
+sampler thread — a thread because `container stats` blocks for two seconds —
+appends the runtime's raw counters every 30 s to a per-project history under
+`~/Library/Application Support/container-compose/history/`, kept for seven days.
+Unlike the health cache, it is not disposable: it outlives the supervisor that
+wrote it, so `stats` can summarise yesterday. The sampler shares only the
+interrupt counter with the loop and reports problems to it over a channel, each
+distinct one once. A missing file, a pid that is
 gone, or a config-hash mismatch means `unknown`, never a stale "healthy". The
 cache is never authority: `up` readiness uses in-process state, deleting the
 file changes only what `ps` prints, and failing to write it warns rather than

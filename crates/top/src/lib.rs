@@ -78,6 +78,7 @@ pub fn run(options: Options) -> io::Result<()> {
         healthchecks,
         interval: options.interval,
         log_lines: options.log_lines,
+        history: container_compose_supervisor::history::path(&declared.project),
     });
     let mut app = App::new(declared);
 

@@ -10,6 +10,7 @@ use container_compose_runtime::ObservedContainer;
 use container_compose_stack::resolve::ResolvedStack;
 use container_compose_supervisor::cache::HealthCache;
 use container_compose_supervisor::clock;
+use container_compose_supervisor::history::{self, Point, Sample};
 
 /// What the stack file declares. `top` runs without one, as `ps` does, so an
 /// interrupted session stays inspectable; then only the project is known.
@@ -81,6 +82,98 @@ pub struct Row {
     pub policy: Option<String>,
     pub ports: Vec<String>,
     pub image: Option<String>,
+    pub usage: Usage,
+}
+
+/// A service's resource use, from the supervisor's history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// CPU over the last sampled interval, in percent of one core; `None`
+    /// without a recent reading.
+    pub cpu: Option<String>,
+    /// Memory at the last reading, with the limit.
+    pub mem: Option<String>,
+    /// One character per [`TREND_BUCKET_SECS`] over the last
+    /// [`TREND_WINDOW_SECS`], oldest first; a space where there is no reading.
+    pub cpu_trend: String,
+    pub mem_trend: String,
+}
+
+/// The span a trend covers.
+pub const TREND_WINDOW_SECS: u64 = 3_600;
+/// The span one trend character covers: twelve characters for the hour.
+pub const TREND_BUCKET_SECS: u64 = 300;
+/// A reading older than this is not "now": three missed samples.
+const CURRENT_WITHIN_SECS: u64 = 90;
+/// A CPU trend is scaled to its own peak, but never below this, so an idle
+/// service's noise draws as a flat floor rather than full-height bars.
+const CPU_TREND_FLOOR_PCT: f64 = 5.0;
+const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+pub fn usage(samples: &[Sample], service: &str, running: bool, now_secs: u64) -> Usage {
+    let points = history::series(samples, service);
+    let since = now_secs.saturating_sub(TREND_WINDOW_SECS);
+    let window: Vec<&Point> = points.iter().filter(|point| point.at > since).collect();
+
+    let current = points
+        .last()
+        .filter(|point| running && now_secs.saturating_sub(point.at) <= CURRENT_WITHIN_SECS);
+
+    let cpu_peak = window
+        .iter()
+        .filter_map(|point| point.cpu_pct)
+        .fold(CPU_TREND_FLOOR_PCT, f64::max);
+    let mem_scale = window
+        .iter()
+        .map(|point| point.mem_limit)
+        .max()
+        .filter(|limit| *limit > 0)
+        .or_else(|| window.iter().map(|point| point.mem).max())
+        .unwrap_or(1) as f64;
+
+    Usage {
+        cpu: current
+            .and_then(|point| point.cpu_pct)
+            .map(history::format_pct),
+        mem: current.map(|point| {
+            if point.mem_limit > 0 {
+                format!(
+                    "{} / {}",
+                    history::format_bytes(point.mem),
+                    history::format_bytes(point.mem_limit)
+                )
+            } else {
+                history::format_bytes(point.mem)
+            }
+        }),
+        cpu_trend: trend(&window, since, |point| point.cpu_pct, cpu_peak),
+        mem_trend: trend(&window, since, |point| Some(point.mem as f64), mem_scale),
+    }
+}
+
+/// Average each bucket's values and draw it as one bar, scaled to `scale`.
+fn trend(points: &[&Point], since: u64, value: fn(&Point) -> Option<f64>, scale: f64) -> String {
+    let buckets = usize::try_from(TREND_WINDOW_SECS / TREND_BUCKET_SECS).unwrap_or(12);
+    let mut sums = vec![(0.0_f64, 0_u32); buckets];
+    for point in points {
+        let Some(value) = value(point) else { continue };
+        let offset = point.at.saturating_sub(since).saturating_sub(1);
+        let index = usize::try_from(offset / TREND_BUCKET_SECS)
+            .unwrap_or(usize::MAX)
+            .min(buckets - 1);
+        sums[index].0 += value;
+        sums[index].1 += 1;
+    }
+    sums.iter()
+        .map(|(sum, count)| {
+            if *count == 0 {
+                return ' ';
+            }
+            let fraction = (sum / f64::from(*count) / scale).clamp(0.0, 1.0);
+            let level = (fraction * (BARS.len() - 1) as f64).round() as usize;
+            BARS[level]
+        })
+        .collect()
 }
 
 impl Row {
@@ -91,15 +184,22 @@ impl Row {
 
 /// One row per declared service, in start order, then one per undeclared
 /// container of the project. Only a cache that [`cache::live`] trusted
-/// should be passed: health and restarts come from it alone.
+/// should be passed: health and restarts come from it alone. Usage comes from
+/// `samples`, the recent history.
 ///
 /// [`cache::live`]: container_compose_supervisor::cache::live
 pub fn rows(
     declared: &Declared,
     containers: &[ObservedContainer],
     cache: Option<&HealthCache>,
+    samples: &[Sample],
     now_secs: u64,
 ) -> Vec<Row> {
+    let context = Context {
+        cache,
+        samples,
+        now_secs,
+    };
     let mine: Vec<&ObservedContainer> = containers
         .iter()
         .filter(|container| container.project() == Some(declared.project.as_str()))
@@ -113,13 +213,7 @@ pub fn rows(
                 .iter()
                 .copied()
                 .find(|container| container.service() == Some(service.as_str()));
-            row(
-                service,
-                container,
-                declared.services.get(service),
-                cache,
-                now_secs,
-            )
+            row(service, container, declared.services.get(service), &context)
         })
         .collect();
 
@@ -133,7 +227,7 @@ pub fn rows(
         })
         .map(|container| {
             let service = container.service().unwrap_or(&container.id).to_owned();
-            row(&service, Some(container), None, cache, now_secs)
+            row(&service, Some(container), None, &context)
         })
         .collect();
     undeclared.sort_by(|a, b| a.service.cmp(&b.service));
@@ -141,14 +235,21 @@ pub fn rows(
     rows
 }
 
+/// What every row is computed against.
+struct Context<'a> {
+    cache: Option<&'a HealthCache>,
+    samples: &'a [Sample],
+    now_secs: u64,
+}
+
 fn row(
     service: &str,
     container: Option<&ObservedContainer>,
     declared: Option<&DeclaredService>,
-    cache: Option<&HealthCache>,
-    now_secs: u64,
+    context: &Context,
 ) -> Row {
-    let cached = cache.and_then(|cache| cache.services.get(service));
+    let now_secs = context.now_secs;
+    let cached = context.cache.and_then(|cache| cache.services.get(service));
     let running = container.is_some_and(ObservedContainer::is_running);
 
     let health = if !running {
@@ -181,6 +282,7 @@ fn row(
             .map(|service| service.ports.clone())
             .unwrap_or_default(),
         image: container.map(|container| container.configuration.image.reference.clone()),
+        usage: usage(context.samples, service, running, now_secs),
     }
 }
 
@@ -263,11 +365,13 @@ pub fn clock_of_day(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        events, format_span, rows, Declared, DeclaredService, Row, NOT_CREATED, NO_CHECK, NO_HEALTH,
+        events, format_span, rows, usage, Declared, DeclaredService, Row, Usage, NOT_CREATED,
+        NO_CHECK, NO_HEALTH, TREND_WINDOW_SECS,
     };
     use container_compose_runtime::ObservedContainer;
     use container_compose_supervisor::cache::{CachedHealth, HealthCache};
     use container_compose_supervisor::clock;
+    use container_compose_supervisor::history::{Reading, Sample};
     use std::collections::BTreeMap;
 
     /// The `container list --all --format json` response captured from the
@@ -337,7 +441,13 @@ mod tests {
 
     #[test]
     fn declared_services_come_first_in_start_order() {
-        let rows = rows(&declared(&["db"]), &captured(), None, started_at_of_api());
+        let rows = rows(
+            &declared(&["db"]),
+            &captured(),
+            None,
+            &[],
+            started_at_of_api(),
+        );
         let services: Vec<&str> = rows.iter().map(|row| row.service.as_str()).collect();
         assert_eq!(services, ["api", "worker", "db"]);
         assert_eq!(rows[2].state, NOT_CREATED);
@@ -349,7 +459,7 @@ mod tests {
         let declared = declared(&[]);
         let now = started_at_of_api() + 125;
         let cache = cache(&declared.project, healthy(2, false));
-        let rows = rows(&declared, &captured(), Some(&cache), now);
+        let rows = rows(&declared, &captured(), Some(&cache), &[], now);
 
         assert_eq!(rows[0].state, "running");
         assert_eq!(rows[0].health, "healthy");
@@ -364,12 +474,12 @@ mod tests {
     #[test]
     fn a_running_service_without_a_cache_is_unknown_unless_it_has_no_check() {
         let declared = declared(&[]);
-        let rows = rows(&declared, &captured(), None, started_at_of_api());
+        let rows = rows(&declared, &captured(), None, &[], started_at_of_api());
         assert_eq!(rows[0].health, "unknown");
 
         let mut unchecked = declared.clone();
         unchecked.services.get_mut("api").unwrap().has_healthcheck = false;
-        let rows = super::rows(&unchecked, &captured(), None, started_at_of_api());
+        let rows = super::rows(&unchecked, &captured(), None, &[], started_at_of_api());
         assert_eq!(rows[0].health, NO_CHECK);
     }
 
@@ -380,6 +490,7 @@ mod tests {
             &Declared::bare(project),
             &captured(),
             None,
+            &[],
             started_at_of_api(),
         );
         let services: Vec<&str> = rows.iter().map(|row| row.service.as_str()).collect();
@@ -393,6 +504,7 @@ mod tests {
             &Declared::bare("someone-else".to_owned()),
             &captured(),
             None,
+            &[],
             0,
         );
         assert!(rows.is_empty());
@@ -418,7 +530,74 @@ mod tests {
             policy: Some("on-stop".to_owned()),
             ports: Vec::new(),
             image: None,
+            usage: Usage::default(),
         }
+    }
+
+    fn reading(cpu_usec: u64, mem: u64) -> Reading {
+        Reading {
+            started: Some("2026-10-26T02:00:00Z".to_owned()),
+            cpu_usec,
+            mem,
+            mem_limit: 1 << 30,
+            ..Reading::default()
+        }
+    }
+
+    fn samples(readings: &[(u64, u64, u64)]) -> Vec<Sample> {
+        readings
+            .iter()
+            .map(|(at, cpu_usec, mem)| Sample {
+                at: *at,
+                services: BTreeMap::from([("node".to_owned(), reading(*cpu_usec, *mem))]),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn usage_shows_the_latest_interval_and_the_limit() {
+        // 3 s of CPU in 30 s is a tenth of a core.
+        let samples = samples(&[(10_000, 0, 100 << 20), (10_030, 3_000_000, 300 << 20)]);
+        let usage = usage(&samples, "node", true, 10_040);
+        assert_eq!(usage.cpu.as_deref(), Some("10%"));
+        assert_eq!(usage.mem.as_deref(), Some("300 MiB / 1.0 GiB"));
+    }
+
+    #[test]
+    fn a_stale_or_stopped_service_has_no_current_usage() {
+        let samples = samples(&[(10_000, 0, 1), (10_030, 3_000_000, 1)]);
+        assert_eq!(usage(&samples, "node", true, 10_030 + 91).cpu, None);
+        assert_eq!(usage(&samples, "node", false, 10_031).mem, None);
+        assert_eq!(
+            usage(&[], "node", true, 10_031),
+            Usage {
+                cpu_trend: " ".repeat(12),
+                mem_trend: " ".repeat(12),
+                ..Usage::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_trend_is_twelve_five_minute_bars_with_gaps_left_blank() {
+        let now = 100_000;
+        let start = now - TREND_WINDOW_SECS;
+        // Busy (one core) in the first bucket, idle in the last; nothing between.
+        let samples = samples(&[
+            (start + 10, 0, 512 << 20),
+            (start + 40, 30_000_000, 512 << 20),
+            (now - 60, 31_000_000, 1 << 30),
+            (now - 30, 31_000_000, 1 << 30),
+        ]);
+        let usage = usage(&samples, "node", true, now);
+        let cpu: Vec<char> = usage.cpu_trend.chars().collect();
+        let mem: Vec<char> = usage.mem_trend.chars().collect();
+        assert_eq!(cpu.len(), 12);
+        assert_eq!(cpu[0], '█', "a full core against a 100% peak");
+        assert!(cpu[1..11].iter().all(|bar| *bar == ' '), "{cpu:?}");
+        assert_eq!(cpu[11], '▁', "idle draws as the floor, not as nothing");
+        assert_eq!(mem[0], '▅', "half the limit");
+        assert_eq!(mem[11], '█', "the whole limit");
     }
 
     #[test]

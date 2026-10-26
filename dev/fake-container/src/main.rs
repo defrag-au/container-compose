@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use container_compose_runtime::{
     ContainerConfiguration, ContainerImage, ContainerStatus, ImageConfiguration,
     NetworkConfiguration, NetworkStatus, Observed, ObservedContainer, ObservedImage,
-    ObservedNetwork, ObservedVolume, VolumeConfiguration,
+    ObservedNetwork, ObservedStats, ObservedVolume, VolumeConfiguration,
 };
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -169,6 +169,7 @@ fn dispatch(args: &[String], world: &mut World) -> Result<(), Failure> {
         "delete" | "rm" => delete(rest, world),
         "inspect" => inspect(rest, world),
         "logs" => logs(rest, world),
+        "stats" => stats(rest, world),
         "exec" => exec(rest, world),
         "volume" => match rest.first().map(String::as_str) {
             Some("create") => volume_create(&rest[1..], world),
@@ -240,6 +241,38 @@ fn list(args: &[String], world: &mut World) -> Result<(), Failure> {
             container.status.state = "running".to_owned();
         }
     }
+    Ok(())
+}
+
+/// One record per running container, in the real response's shape. The fake
+/// runs no processes, so every counter is zero rather than invented; only the
+/// set of containers reported is meaningful. Like the real runtime, naming a
+/// container that is not running fails.
+fn stats(args: &[String], world: &mut World) -> Result<(), Failure> {
+    let parsed = parse(args, &["--format"], &["--no-stream", "--debug"])?;
+    for name in &parsed.positionals {
+        let running = world
+            .observed
+            .container(name)
+            .is_some_and(ObservedContainer::is_running);
+        if !running {
+            return Err(Failure::domain(format!("container {name} is not running")));
+        }
+    }
+    let output: Vec<ObservedStats> = world
+        .observed
+        .containers
+        .iter()
+        .filter(|container| container.is_running())
+        .filter(|container| {
+            parsed.positionals.is_empty() || parsed.positionals.contains(&container.id)
+        })
+        .map(|container| ObservedStats {
+            id: container.id.clone(),
+            ..ObservedStats::default()
+        })
+        .collect();
+    println!("{}", serde_json::to_string(&output).expect("json"));
     Ok(())
 }
 
