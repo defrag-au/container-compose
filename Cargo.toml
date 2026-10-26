@@ -5,6 +5,7 @@ members = [
     "crates/runtime",
     "crates/plan",
     "crates/supervisor",
+    "crates/top",
     "crates/cli",
     "dev/fake-container",
 ]
@@ -21,11 +22,17 @@ container-compose-plan = { path = "crates/plan" }
 container-compose-runtime = { path = "crates/runtime" }
 container-compose-stack = { path = "crates/stack" }
 container-compose-supervisor = { path = "crates/supervisor" }
+container-compose-top = { path = "crates/top" }
 
 assert_cmd = "2"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
-serde = { version = "1", features = ["derive"] }
+# `top` only. The crossterm backend alone: the calendar widget, the macros and
+# the layout cache are default features nothing here uses. Ratatui re-exports
+# the crossterm it was built against as `ratatui::crossterm`; there is no
+# separate crossterm pin, so two versions cannot end up in the tree.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+serde ={ version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 sha2 = "0.10"

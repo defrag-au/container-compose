@@ -210,6 +210,50 @@ it.
 `checked_at` and `source` (`supervisor`, `probe`, or `none`), not a formatted
 string.
 
+## `top`
+
+```sh
+container-compose top [--interval 1s] [-n 200]
+```
+
+`ps`, kept live in the terminal. One row per declared service in start order —
+including any not yet created — then any undeclared container of the project:
+
+```
+ midnight-lab   supervisor pid 5630  ·  updated 01:50:28Z
+  SERVICE   STATE    HEALTH    UPTIME  RESTARTS  POLICY   PORTS
+▶ node      running  healthy   32s     0         no       127.0.0.1:9944->9944
+  indexer   running  no check  12s     1         on-stop  127.0.0.1:8088->8088
+```
+
+Below the table, an events pane lists what changed between polls — a state, a
+health, a restart, a give-up — newest first, and a logs pane follows the
+selected service's last `-n` lines.
+
+| key | does |
+|---|---|
+| `↑` `↓` (`k` `j`) | select a service; its logs follow |
+| `p` | run the selected service's healthcheck now, as `ps --probe` does |
+| `r` | poll now |
+| `PgUp` `PgDn` `End` | scroll the logs; `End` returns to the tail |
+| `q`, `Esc`, `Ctrl-C` | quit |
+
+`top` reads what `ps` reads, and nothing else: the runtime's container list and a
+live supervisor's health cache. It takes no lock and starts or stops nothing, so
+it runs beside `up`. `HEALTH` follows `ps`'s rules, except that a running service
+declaring no healthcheck shows `no check` rather than `unknown`. `RESTARTS` comes
+from the cache, so without a live supervisor it is `0`.
+
+It polls with `container list` alone, not the full observation `plan` and `ps`
+use, so it does not gate on `container system status`. That status answers
+`unregistered` to any launchd session other than the one that started the runtime
+— an SSH login, typically — while `list` works from anywhere, so `top` works over
+SSH where `ps` refuses.
+
+Like `ps`, it works without the stack file, from the project's containers alone;
+then there is no on-demand probe. Without a terminal it refuses (exit 1) and
+points at `ps --json`.
+
 ## `logs`
 
 ```sh

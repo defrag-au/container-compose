@@ -215,7 +215,10 @@ healthcheck can never pass, and the message says which binary is missing.
 Health is a property of the supervision session, not of the container, because
 nothing in the runtime records it. The supervisor writes a small per-project
 cache — `~/Library/Caches/container-compose/<project>.json`, holding its pid and
-the last result per service — and `ps` reads it. A missing file, a pid that is
+the last result per service, with the restarts it has issued for each and whether
+it gave up — and `ps` and `top` read it. The restart count is history for a
+reader and never resets; the tick's attempt counter, which does reset after 60 s
+of healthy uptime, stays in memory. A missing file, a pid that is
 gone, or a config-hash mismatch means `unknown`, never a stale "healthy". The
 cache is never authority: `up` readiness uses in-process state, deleting the
 file changes only what `ps` prints, and failing to write it warns rather than

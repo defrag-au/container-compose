@@ -1,7 +1,7 @@
 //! The command line.
 //!
-//! `config`, `plan`, `up` (foreground and detached), `down`, `ps` and `logs`
-//! are implemented. The foreground `up` is the supervisor.
+//! `config`, `plan`, `up` (foreground and detached), `down`, `ps`, `top` and
+//! `logs` are implemented. The foreground `up` is the supervisor.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -19,7 +19,6 @@ use container_compose_runtime::{
 use container_compose_stack::duration::Span;
 use container_compose_stack::env::{self, Guard};
 use container_compose_stack::model::{PullPolicy, RestartPolicy};
-use container_compose_stack::ports::Protocol;
 use container_compose_stack::resolve::{
     MountSource, ResolvedHealthcheck, ResolvedService, ResolvedStack,
 };
@@ -184,6 +183,15 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// A live, read-only dashboard: state, health, restarts and logs per service.
+    Top {
+        /// How often the runtime is polled.
+        #[arg(long, default_value = "1s", value_parser = parse_span)]
+        interval: Span,
+        /// Log lines fetched for the selected service.
+        #[arg(short = 'n', long, default_value = "200")]
+        lines: u32,
+    },
     /// Print a service's logs.
     Logs {
         /// Services to show; default is all.
@@ -229,6 +237,7 @@ pub fn run(cli: Cli) -> Result<(), Error> {
             dry_run,
         } => down_command(&cli, *volumes, *timeout, *dry_run),
         Command::Ps { json, probe } => ps_command(&cli, *json, *probe),
+        Command::Top { interval, lines } => top_command(&cli, *interval, *lines),
         Command::Logs {
             services,
             follow,
@@ -536,6 +545,34 @@ fn ps_command(cli: &Cli, json: bool, probe_now: bool) -> Result<(), Error> {
         println!();
     }
     Ok(())
+}
+
+fn top_command(cli: &Cli, interval: Span, lines: u32) -> Result<(), Error> {
+    // Like `ps`, `top` works without the stack file, so an interrupted session
+    // stays inspectable. A file that exists but does not load is still an error.
+    let stack = if cli.file.exists() {
+        Some(stack::load(
+            &cli.file,
+            &Options {
+                project_name: cli.project_name.clone(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let project = stack
+        .as_ref()
+        .map(|stack| stack.name.clone())
+        .unwrap_or_else(|| project_from_path(cli));
+
+    container_compose_top::run(container_compose_top::Options {
+        runtime: cli.runtime.clone(),
+        project,
+        stack,
+        interval: interval.as_duration(),
+        log_lines: lines,
+    })
+    .map_err(|error| Error::Runtime(error.to_string()))
 }
 
 struct TerminalFlags {
@@ -1205,21 +1242,7 @@ fn push_ps_row(out: &mut String, cells: &[String; 6], widths: &[usize; 6]) {
 }
 
 fn render_ports(service: &ResolvedService) -> Vec<String> {
-    service
-        .ports
-        .iter()
-        .map(|port| {
-            let mut rendered = String::new();
-            if let Some((address, host_port)) = port.host_binding() {
-                rendered.push_str(&format!("{address}:{host_port}->"));
-            }
-            rendered.push_str(&port.container_port.to_string());
-            if port.protocol == Protocol::Udp {
-                rendered.push_str("/udp");
-            }
-            rendered
-        })
-        .collect()
+    service.ports.iter().map(|port| port.display()).collect()
 }
 
 /// Known services in start order, then anything else by name.

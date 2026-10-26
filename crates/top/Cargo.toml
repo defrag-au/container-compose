@@ -1,0 +1,15 @@
+[package]
+name = "container-compose-top"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "A read-only terminal dashboard for a running stack"
+
+[dependencies]
+container-compose-runtime.workspace = true
+container-compose-stack.workspace = true
+container-compose-supervisor.workspace = true
+ratatui.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

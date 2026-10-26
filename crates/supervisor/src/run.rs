@@ -58,6 +58,15 @@ impl From<std::io::Error> for SupervisorError {
     }
 }
 
+/// What this supervisor has done to one service, for readers of the cache.
+/// Owned by the loop, so the tick's backoff state stays the tick's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct History {
+    restarts: u32,
+    last_restart_at: Option<String>,
+    gave_up: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnInterrupt {
     Leave,
@@ -94,6 +103,7 @@ pub fn run(
             .collect(),
     );
     let start = Instant::now();
+    let mut history: BTreeMap<String, History> = BTreeMap::new();
 
     writeln!(
         out,
@@ -101,7 +111,7 @@ pub fn run(
         services.len(),
         if services.len() == 1 { "" } else { "s" }
     )?;
-    publish(stack, &supervisor, out);
+    publish(stack, &supervisor, &history, out);
 
     loop {
         if interrupted(&interrupts) {
@@ -147,10 +157,18 @@ pub fn run(
                         "give up  {service}  after {attempts} restart{}",
                         if attempts == 1 { "" } else { "s" }
                     );
+                    history.entry(service).or_default().gave_up = true;
+                    cache_dirty = true;
                 }
                 Action::Restart { service, attempt } => {
                     let name = argv::container_name(&stack.name, &service);
                     let _ = writeln!(out, "restart  {name}  attempt {attempt}");
+                    let record = history.entry(service).or_default();
+                    record.restarts = record.restarts.saturating_add(1);
+                    record.last_restart_at =
+                        Some(clock::format_rfc3339_seconds(clock::wall_ms() / 1_000));
+                    record.gave_up = false;
+                    cache_dirty = true;
                     if let Err(error) = Command::new(&options.runtime)
                         .args(argv::start_container(&name))
                         .run()
@@ -182,7 +200,7 @@ pub fn run(
         }
 
         if cache_dirty {
-            publish(stack, &supervisor, out);
+            publish(stack, &supervisor, &history, out);
         }
         sleep(options.poll_interval, &interrupts);
     }
@@ -260,7 +278,12 @@ fn views_for(
         .collect()
 }
 
-fn publish(stack: &ResolvedStack, supervisor: &Supervisor, out: &mut dyn Write) {
+fn publish(
+    stack: &ResolvedStack,
+    supervisor: &Supervisor,
+    history: &BTreeMap<String, History>,
+    out: &mut dyn Write,
+) {
     let services = supervisor
         .health_snapshot()
         .into_iter()
@@ -268,11 +291,15 @@ fn publish(stack: &ResolvedStack, supervisor: &Supervisor, out: &mut dyn Write) 
             let checked_at = supervisor
                 .checked_at(&name)
                 .map(|millis| clock::format_rfc3339_seconds(millis / 1_000));
+            let record = history.get(&name).cloned().unwrap_or_default();
             (
                 name,
                 CachedHealth {
                     state: health.as_str().to_owned(),
                     checked_at,
+                    restarts: record.restarts,
+                    last_restart_at: record.last_restart_at,
+                    gave_up: record.gave_up,
                 },
             )
         })

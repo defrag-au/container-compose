@@ -1116,6 +1116,9 @@ fn ps_reads_a_live_supervisors_health_cache() {
                 CachedHealth {
                     state: "healthy".to_owned(),
                     checked_at: Some("2026-10-24T00:00:01Z".to_owned()),
+                    restarts: 0,
+                    last_restart_at: None,
+                    gave_up: false,
                 },
             )]),
         },
@@ -1142,6 +1145,9 @@ fn ps_reads_a_live_supervisors_health_cache() {
                 CachedHealth {
                     state: "healthy".to_owned(),
                     checked_at: None,
+                    restarts: 0,
+                    last_restart_at: None,
+                    gave_up: false,
                 },
             )]),
         },

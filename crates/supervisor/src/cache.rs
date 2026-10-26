@@ -31,6 +31,17 @@ pub struct HealthCache {
 pub struct CachedHealth {
     pub state: String,
     pub checked_at: Option<String>,
+    /// Restarts this supervisor has issued for the service since it started.
+    /// Unlike the tick's attempt counter, this never resets on stable uptime:
+    /// it is history for a reader, not backoff state. Absent in a cache
+    /// written before it existed, which reads as zero.
+    #[serde(default)]
+    pub restarts: u32,
+    #[serde(default)]
+    pub last_restart_at: Option<String>,
+    /// The supervisor stopped restarting the service (`max_retries` reached).
+    #[serde(default)]
+    pub gave_up: bool,
 }
 
 pub fn dir() -> Option<PathBuf> {
@@ -136,9 +147,42 @@ mod tests {
                 CachedHealth {
                     state: "healthy".to_owned(),
                     checked_at: Some("2026-10-24T00:00:01Z".to_owned()),
+                    restarts: 0,
+                    last_restart_at: None,
+                    gave_up: false,
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn a_cache_written_before_restart_history_still_reads() {
+        // The document this crate wrote before `restarts`, `last_restart_at`
+        // and `gave_up` existed, as captured from a live midnight-lab
+        // supervisor's cache file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("midnight-lab.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "pid": 43564,
+  "project": "midnight-lab",
+  "config": "2a9ac5706fb80bbd",
+  "updated_at": "2026-10-26T01:18:08Z",
+  "services": {
+    "indexer": { "state": "unknown", "checked_at": null },
+    "node": { "state": "healthy", "checked_at": "2026-10-26T01:18:08Z" }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let read_back = read_at(&path).expect("an older cache still parses");
+        let node = &read_back.services["node"];
+        assert_eq!(node.state, "healthy");
+        assert_eq!(node.restarts, 0);
+        assert_eq!(node.last_restart_at, None);
+        assert!(!node.gave_up);
     }
 
     #[test]
