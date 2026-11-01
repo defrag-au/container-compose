@@ -119,28 +119,35 @@ struct SystemStatus {
     status: String,
 }
 
-/// Read the runtime's world in four calls, gated on `system status`.
+/// Read the runtime's world in five calls; `system status` is advisory.
 pub fn observe(program: &str) -> Result<Observed, RuntimeError> {
-    let status: SystemStatus = parse(
-        "`container system status`",
-        &run(program, &["system", "status", "--format", "json"])?,
-    )?;
-    if status.status != "running" {
-        return Err(RuntimeError::message(format!(
-            "the container runtime is not running (status: `{}`); run `container system start`",
-            status.status
-        )));
-    }
+    // `system status` answers `unregistered` to a launchd session other than
+    // the one that started the runtime (an SSH login, typically) while `list`
+    // works from anywhere — so it must not gate. Ask it only to keep the
+    // actionable message for a genuinely stopped runtime, and let `list` decide.
+    let status = run(program, &["system", "status", "--format", "json"])
+        .ok()
+        .and_then(|output| parse::<SystemStatus>("`container system status`", &output).ok())
+        .map(|status| status.status);
+
+    let containers = match run(program, &["list", "--all", "--format", "json"]) {
+        Ok(output) => parse("`container list`", &output)?,
+        Err(error) => {
+            if let Some(status) = status.filter(|status| status != "running") {
+                return Err(RuntimeError::message(format!(
+                    "the container runtime is not running (status: `{status}`); run `container system start`"
+                )));
+            }
+            return Err(error);
+        }
+    };
 
     Ok(Observed {
         dns_domains: parse(
             "`container system dns list`",
             &run(program, &["system", "dns", "list", "--format", "json"])?,
         )?,
-        containers: parse(
-            "`container list`",
-            &run(program, &["list", "--all", "--format", "json"])?,
-        )?,
+        containers,
         volumes: parse(
             "`container volume list`",
             &run(program, &["volume", "list", "--format", "json"])?,
@@ -154,6 +161,47 @@ pub fn observe(program: &str) -> Result<Observed, RuntimeError> {
             &run(program, &["image", "list", "--format", "json"])?,
         )?,
     })
+}
+
+/// One container's resource counters from `container stats --format json`.
+///
+/// CPU, network and block I/O are cumulative since the container started, so a
+/// rate is a difference between two readings; memory and processes are
+/// instantaneous. The shape is `fixtures/real/container-stats.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedStats {
+    pub id: String,
+    #[serde(default)]
+    pub cpu_usage_usec: u64,
+    #[serde(default)]
+    pub memory_usage_bytes: u64,
+    #[serde(default)]
+    pub memory_limit_bytes: u64,
+    #[serde(default)]
+    pub network_rx_bytes: u64,
+    #[serde(default)]
+    pub network_tx_bytes: u64,
+    #[serde(default)]
+    pub block_read_bytes: u64,
+    #[serde(default)]
+    pub block_write_bytes: u64,
+    #[serde(default)]
+    pub num_processes: u64,
+}
+
+/// `stats --no-stream`, for every running container, parsed.
+///
+/// No container ids are passed: naming one that is not running fails the whole
+/// call, and the caller filters by name anyway. The runtime takes two samples
+/// two seconds apart before printing, so this blocks for at least that long.
+/// A container whose statistics call fails inside the runtime is left out
+/// rather than reported, so absence means "no reading", not zero.
+pub fn stats(program: &str) -> Result<Vec<ObservedStats>, RuntimeError> {
+    parse(
+        "`container stats`",
+        &run(program, &["stats", "--no-stream", "--format", "json"])?,
+    )
 }
 
 /// `list --all`, parsed. The start phase polls this rather than calling the

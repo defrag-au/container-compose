@@ -12,11 +12,15 @@
 //!   handlers and writes the health cache.
 //! - [`cache`] and [`lock`] are the two pieces of on-disk state: the health
 //!   `ps` reads, and the pid that keeps two supervisors off one project.
+//! - [`history`] is the third: the resource samples `stats` and `top` read,
+//!   written by a sampler thread `run` starts.
 
 pub mod cache;
 pub mod clock;
+pub mod history;
 pub mod lock;
 pub mod run;
+mod sampler;
 pub mod tick;
 
 pub use run::{interrupt_action, run, OnInterrupt, Options, SupervisorError};

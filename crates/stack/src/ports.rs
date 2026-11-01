@@ -123,6 +123,20 @@ impl PortSpec {
             .unwrap_or_else(|| "127.0.0.1".to_owned());
         Some((ip, port))
     }
+
+    /// The `ps` form: `127.0.0.1:8184->8184`, `8184` when nothing is published,
+    /// with `/udp` appended for UDP.
+    pub fn display(&self) -> String {
+        let mut rendered = String::new();
+        if let Some((address, host_port)) = self.host_binding() {
+            rendered.push_str(&format!("{address}:{host_port}->"));
+        }
+        rendered.push_str(&self.container_port.to_string());
+        if self.protocol == Protocol::Udp {
+            rendered.push_str("/udp");
+        }
+        rendered
+    }
 }
 
 fn parse_port(value: &str, whole: &str) -> Result<u16, String> {
@@ -153,6 +167,19 @@ mod tests {
         let loopback = PortSpec::parse("127.0.0.1:8184:8184").unwrap();
         assert_eq!(loopback.host_ip.unwrap().to_string(), "127.0.0.1");
         assert_eq!(loopback.host_port, Some(8184));
+    }
+
+    #[test]
+    fn displays_in_the_ps_form() {
+        assert_eq!(
+            PortSpec::parse("127.0.0.1:9944:9944").unwrap().display(),
+            "127.0.0.1:9944->9944"
+        );
+        assert_eq!(PortSpec::parse("8184").unwrap().display(), "8184");
+        assert_eq!(
+            PortSpec::parse("127.0.0.1:5353:53/udp").unwrap().display(),
+            "127.0.0.1:5353->53/udp"
+        );
     }
 
     #[test]

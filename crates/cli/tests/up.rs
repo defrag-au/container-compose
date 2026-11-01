@@ -1,4 +1,4 @@
-//! `up`, `down` and `ps` through the real binary, against the fake runtime.
+//! `up`, `down`, `ps` and `stats` through the real binary, against the fake runtime.
 //!
 //! The fake is the `container` on the child's `PATH`, so these tests exercise
 //! the same argv, the same polling and the same ownership filters a real runtime
@@ -18,6 +18,7 @@ use container_compose_runtime::{
     labels, ContainerConfiguration, ContainerImage, ContainerStatus, Observed, ObservedContainer,
 };
 use container_compose_supervisor::cache::{write_at, CachedHealth, HealthCache};
+use container_compose_supervisor::history::{append_at, Reading, Sample};
 
 #[derive(Debug, Deserialize)]
 struct Call {
@@ -101,6 +102,8 @@ impl Fake {
             )
             .env("FAKE_CONTAINER_DIR", &self.world)
             .env("CONTAINER_COMPOSE_CACHE_DIR", &self.cache)
+            // A supervised test must never append to the user's real history.
+            .env("CONTAINER_COMPOSE_HISTORY_DIR", self.cache.join("history"))
             .args(args);
         command
     }
@@ -1116,6 +1119,9 @@ fn ps_reads_a_live_supervisors_health_cache() {
                 CachedHealth {
                     state: "healthy".to_owned(),
                     checked_at: Some("2026-10-24T00:00:01Z".to_owned()),
+                    restarts: 0,
+                    last_restart_at: None,
+                    gave_up: false,
                 },
             )]),
         },
@@ -1142,6 +1148,9 @@ fn ps_reads_a_live_supervisors_health_cache() {
                 CachedHealth {
                     state: "healthy".to_owned(),
                     checked_at: None,
+                    restarts: 0,
+                    last_restart_at: None,
+                    gave_up: false,
                 },
             )]),
         },
@@ -1168,6 +1177,7 @@ fn spawn_up(fake: &Fake, path: &str, extra: &[&str]) -> std::process::Child {
         )
         .env("FAKE_CONTAINER_DIR", &fake.world)
         .env("CONTAINER_COMPOSE_CACHE_DIR", &fake.cache)
+        .env("CONTAINER_COMPOSE_HISTORY_DIR", fake.cache.join("history"))
         .args(["-f", path, "up"])
         .args(extra)
         .stdout(std::process::Stdio::piped())
@@ -1651,4 +1661,136 @@ volumes = ["data:/data"]
         .expect("runs");
     assert_eq!(run.status.code(), Some(3), "stderr: {}", stderr(&run));
     assert!(stderr(&run).contains("named volume"), "{}", stderr(&run));
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsDoc {
+    project: String,
+    samples: usize,
+    gaps: usize,
+    services: Vec<StatsSummaryDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsSummaryDoc {
+    service: String,
+    readings: usize,
+    cpu_avg_pct: Option<f64>,
+    mem_peak: u64,
+    mem_limit: u64,
+}
+
+/// Three samples of the `echo` service 30 s apart, then one after a gap, all
+/// ending a minute ago. The counters are the captured midnight node reading
+/// (`fixtures/real/container-stats.json`), advanced by 3 s of CPU per sample.
+fn write_history(fake: &Fake, now: u64) {
+    let captured: Vec<container_compose_runtime::ObservedStats> =
+        serde_json::from_str(&fixture_file("real/container-stats.json")).expect("captured stats");
+    let node = captured
+        .iter()
+        .find(|reading| reading.id == "midnight-lab-node")
+        .expect("the node's reading");
+    let path = fake.cache.join("history").join("minimal.jsonl");
+    for (index, at) in [now - 300, now - 270, now - 240, now - 60]
+        .into_iter()
+        .enumerate()
+    {
+        let reading = Reading {
+            started: Some("2026-10-26T01:49:56Z".to_owned()),
+            cpu_usec: node.cpu_usage_usec + 3_000_000 * index as u64,
+            mem: node.memory_usage_bytes,
+            mem_limit: node.memory_limit_bytes,
+            net_rx: node.network_rx_bytes,
+            net_tx: node.network_tx_bytes,
+            blk_read: node.block_read_bytes,
+            blk_write: node.block_write_bytes,
+            pids: node.num_processes,
+        };
+        append_at(
+            &path,
+            &Sample {
+                at,
+                services: BTreeMap::from([("echo".to_owned(), reading)]),
+            },
+        )
+        .expect("append a sample");
+    }
+}
+
+fn fixture_file(relative: &str) -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .join(relative),
+    )
+    .expect("a fixture")
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs()
+}
+
+#[test]
+fn stats_summarises_the_history_window() {
+    let fake = Fake::new();
+    write_history(&fake, epoch_now());
+
+    let listed = fake
+        .command(&[
+            "-f",
+            &fixture("minimal"),
+            "stats",
+            "--since",
+            "10m",
+            "--json",
+        ])
+        .output()
+        .expect("runs");
+    assert!(listed.status.success(), "stderr: {}", stderr(&listed));
+    let document: StatsDoc = serde_json::from_slice(&listed.stdout).expect("a stats document");
+    assert_eq!(document.project, "minimal");
+    assert_eq!(document.samples, 4);
+    assert_eq!(
+        document.gaps, 1,
+        "180 s between the third and fourth samples"
+    );
+
+    let echo = &document.services[0];
+    assert_eq!(echo.service, "echo");
+    assert_eq!(echo.readings, 4);
+    // 3 s of CPU per 30 s is 10% of a core; across the gap it is 3 s in 180 s.
+    let expected = (10.0 + 10.0 + 3.0 / 180.0 * 100.0) / 3.0;
+    let average = echo.cpu_avg_pct.expect("rates exist");
+    assert!((average - expected).abs() < 1e-9, "{average} vs {expected}");
+    assert_eq!(echo.mem_peak, 332_886_016);
+    assert_eq!(echo.mem_limit, 1 << 30);
+
+    let table = fake
+        .command(&["-f", &fixture("minimal"), "stats", "--since", "10m"])
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(text.contains("minimal · last 10m · 4 samples"), "{text}");
+    assert!(text.contains("1 gap"), "{text}");
+    assert!(text.contains("317 MiB"), "{text}");
+}
+
+#[test]
+fn stats_outside_the_window_says_there_is_no_history() {
+    let fake = Fake::new();
+    write_history(&fake, epoch_now() - 7_200);
+
+    let table = fake
+        .command(&["-f", &fixture("minimal"), "stats", "--since", "1h"])
+        .output()
+        .expect("runs");
+    assert!(table.status.success(), "stderr: {}", stderr(&table));
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        text.starts_with("no history for minimal in the last 1h"),
+        "{text}"
+    );
 }

@@ -15,6 +15,6 @@ pub use command::{Command, Completion, Output, RuntimeError};
 pub use observe::{
     normalize_image_reference, observe, ContainerConfiguration, ContainerImage, ContainerStatus,
     ImageConfiguration, NetworkConfiguration, NetworkStatus, Observed, ObservedContainer,
-    ObservedImage, ObservedNetwork, ObservedVolume, VolumeConfiguration,
+    ObservedImage, ObservedNetwork, ObservedStats, ObservedVolume, VolumeConfiguration,
 };
 pub use probe::{probe, Probe};

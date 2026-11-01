@@ -87,6 +87,8 @@ domain was registered do not get a name — `down` then `up` after setting it.
 | `up` | create and start in dependency order, then supervise until Ctrl-C |
 | `down` | stop and delete what this project owns; `--volumes`, `--timeout` |
 | `ps` | what is running, with health; `--probe`, `--json` |
+| `top` | `ps` kept live in the terminal, with CPU and memory, restarts, changes and the selected service's logs |
+| `stats` | CPU, memory, network and disk per service over a window, from the supervisor's history; `--since`, `--json` |
 | `logs`, `exec`, `run` | the runtime's own, scoped to the stack |
 | `build`, `pull` | the images the stack declares |
 

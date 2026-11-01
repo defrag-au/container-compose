@@ -210,6 +210,105 @@ it.
 `checked_at` and `source` (`supervisor`, `probe`, or `none`), not a formatted
 string.
 
+## `top`
+
+```sh
+container-compose top [--interval 1s] [-n 200]
+```
+
+`ps`, kept live in the terminal. One row per declared service in start order —
+including any not yet created — then any undeclared container of the project:
+
+```
+ midnight-lab   supervisor pid 96974  ·  updated 02:33:12Z
+  SERVICE   STATE    HEALTH    UPTIME  RESTARTS  CPU   CPU 1h  MEMORY             MEM 1h  PORTS
+▶ node      running  healthy   2m 00s  0         0.9%     ▁▂  312 MiB / 1.0 GiB     ▃▃  127.0.0.1:9944->9944
+  indexer   running  no check  1m 54s  0         0.5%     ▁▂  158 MiB / 1.0 GiB     ▂▂  127.0.0.1:8088->8088
+```
+
+`CPU` and `MEMORY` are the last interval of the supervisor's resource history
+(see [`stats`](#stats)): CPU in percent of one core, memory against the
+container's limit. The `1h` columns are twelve five-minute bars, oldest first,
+blank where there is no reading. CPU bars are scaled to the hour's peak (never
+below 5%, so idle noise draws as a floor); memory bars to the limit. Without a
+supervisor, or for a reading more than 90 s old, the values are `—`.
+
+Below the table, an events pane lists what changed between polls — a state, a
+health, a restart, a give-up — newest first, and a logs pane follows the
+selected service's last `-n` lines. Its title carries the selected service's
+image and restart policy.
+
+| key | does |
+|---|---|
+| `↑` `↓` (`k` `j`) | select a service; its logs follow |
+| `p` | run the selected service's healthcheck now, as `ps --probe` does |
+| `r` | poll now |
+| `PgUp` `PgDn` `End` | scroll the logs; `End` returns to the tail |
+| `q`, `Esc`, `Ctrl-C` | quit |
+
+`top` reads what `ps` reads, and nothing else: the runtime's container list and a
+live supervisor's health cache. It takes no lock and starts or stops nothing, so
+it runs beside `up`. `HEALTH` follows `ps`'s rules, except that a running service
+declaring no healthcheck shows `no check` rather than `unknown`. `RESTARTS` comes
+from the cache, so without a live supervisor it is `0`.
+
+It polls with `container list` alone, not the full observation `plan` and `ps`
+use, so it does not gate on `container system status`. That status answers
+`unregistered` to any launchd session other than the one that started the runtime
+— an SSH login, typically — while `list` works from anywhere, so `top` works over
+SSH where `ps` refuses.
+
+Like `ps`, it works without the stack file, from the project's containers alone;
+then there is no on-demand probe. Without a terminal it refuses (exit 1) and
+points at `ps --json`.
+
+## `stats`
+
+```sh
+container-compose stats [--since 1h] [--json]
+```
+
+Resource use per service over a window, from the supervisor's history:
+
+```
+midnight-lab · last 10m · 3 samples from 2026-10-26T02:31:51Z to 2026-10-26T02:32:56Z
+
+SERVICE  READINGS  CPU AVG  CPU PEAK  MEM AVG  MEM PEAK  LIMIT    NET IN   NET OUT  DISK READ  DISK WRITE  RESTARTS
+node     3         0.9%     1.0%      310 MiB  312 MiB   1.0 GiB  286 KiB  114 KiB  1 MiB      404 KiB     0
+```
+
+While `up` supervises, a sampler thread runs `container stats` every 30 s and
+appends one line per sample to
+`~/Library/Application Support/container-compose/history/<project>.jsonl`
+(`CONTAINER_COMPOSE_HISTORY_DIR` overrides the directory). Lines older than
+seven days are pruned at start and hourly; the midnight lab's three services
+add about 1 MB a day. The file holds the runtime's raw counters — CPU time,
+memory and its limit, network and block bytes, processes — and the container's
+start time; rates are derived when read.
+
+- CPU is in percent of one core, so four busy cores is 400%.
+- A container that restarted resets its counters. A changed start time breaks
+  the series there instead of producing a negative rate, and `RESTARTS` counts
+  those breaks.
+- The bytes columns sum what moved over continuous intervals within the window.
+- A gap — two samples more than 60 s apart — is time no supervisor ran, and the
+  header counts them. A service missing from a sample means the runtime gave
+  no reading for it; it is never counted as zero.
+- The first sample is taken one interval after `up` starts supervising.
+- `--since` takes the stack file's durations (`90m`, `168h`); there is no day
+  unit.
+
+The stack file only orders the rows; without one, services come from the
+history. `--json` emits one document: `samples`, `first_at`, `last_at`, `gaps`
+and a typed summary per service.
+
+The runtime's own `container stats` leaves out any container whose statistics
+call fails, without saying so. One cause, found on the midnight-lab node: a
+container whose PID 1 holds an auto-bound route netlink socket (libp2p's
+interface watcher does) takes port ID 1, which the VM's init needs for its own
+statistics socket. `init = true` on the service moves its process off PID 1;
+apple/containerization#910 fixes the bind itself.
+
 ## `logs`
 
 ```sh

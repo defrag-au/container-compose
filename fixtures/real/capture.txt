@@ -12,3 +12,5 @@
 # container network list --format json   -> network-list.json
 # container image list --format json     -> image-list.json
 # container logs ccfixtures-31236-api -> logs-api.txt
+# container stats --no-stream --format json -> container-stats.json (captured separately
+#   2026-10-26 from the midnight-lab devnet, three running containers; container 1.6.0)

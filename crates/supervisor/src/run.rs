@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -18,6 +18,8 @@ use container_compose_stack::resolve::{ResolvedHealthcheck, ResolvedStack};
 
 use crate::cache::{self, CachedHealth, HealthCache};
 use crate::clock;
+use crate::history;
+use crate::sampler::Sampler;
 use crate::tick::{Action, ProbeOutcome, ServiceSpec, Supervisor, Update, View};
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,8 @@ pub struct Options {
     /// The first interrupt leaves everything running.
     pub no_stop_on_exit: bool,
     pub verbose: bool,
+    /// How often to record resource usage to the history; `None` records none.
+    pub sample_interval: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -56,6 +60,15 @@ impl From<std::io::Error> for SupervisorError {
     fn from(error: std::io::Error) -> Self {
         SupervisorError::Output(error)
     }
+}
+
+/// What this supervisor has done to one service, for readers of the cache.
+/// Owned by the loop, so the tick's backoff state stays the tick's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct History {
+    restarts: u32,
+    last_restart_at: Option<String>,
+    gave_up: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +107,25 @@ pub fn run(
             .collect(),
     );
     let start = Instant::now();
+    let mut records: BTreeMap<String, History> = BTreeMap::new();
+
+    let (warnings_tx, warnings) = mpsc::channel::<String>();
+    if let (Some(interval), Some(path)) = (options.sample_interval, history::path(&stack.name)) {
+        Sampler {
+            runtime: options.runtime.clone(),
+            path,
+            containers: services
+                .iter()
+                .map(|service| (argv::container_name(&stack.name, service), service.clone()))
+                .collect(),
+            interval,
+            interrupts: interrupts.clone(),
+            warnings: warnings_tx,
+        }
+        // Not joined: it checks the interrupt counter every 100 ms, and a
+        // sample it appends while the services stop is harmless.
+        .spawn();
+    }
 
     writeln!(
         out,
@@ -101,11 +133,14 @@ pub fn run(
         services.len(),
         if services.len() == 1 { "" } else { "s" }
     )?;
-    publish(stack, &supervisor, out);
+    publish(stack, &supervisor, &records, out);
 
     loop {
         if interrupted(&interrupts) {
             break;
+        }
+        while let Ok(warning) = warnings.try_recv() {
+            let _ = writeln!(out, "warning: {warning}");
         }
 
         let now_ms = elapsed(start);
@@ -147,10 +182,18 @@ pub fn run(
                         "give up  {service}  after {attempts} restart{}",
                         if attempts == 1 { "" } else { "s" }
                     );
+                    records.entry(service).or_default().gave_up = true;
+                    cache_dirty = true;
                 }
                 Action::Restart { service, attempt } => {
                     let name = argv::container_name(&stack.name, &service);
                     let _ = writeln!(out, "restart  {name}  attempt {attempt}");
+                    let record = records.entry(service).or_default();
+                    record.restarts = record.restarts.saturating_add(1);
+                    record.last_restart_at =
+                        Some(clock::format_rfc3339_seconds(clock::wall_ms() / 1_000));
+                    record.gave_up = false;
+                    cache_dirty = true;
                     if let Err(error) = Command::new(&options.runtime)
                         .args(argv::start_container(&name))
                         .run()
@@ -182,7 +225,7 @@ pub fn run(
         }
 
         if cache_dirty {
-            publish(stack, &supervisor, out);
+            publish(stack, &supervisor, &records, out);
         }
         sleep(options.poll_interval, &interrupts);
     }
@@ -260,7 +303,12 @@ fn views_for(
         .collect()
 }
 
-fn publish(stack: &ResolvedStack, supervisor: &Supervisor, out: &mut dyn Write) {
+fn publish(
+    stack: &ResolvedStack,
+    supervisor: &Supervisor,
+    records: &BTreeMap<String, History>,
+    out: &mut dyn Write,
+) {
     let services = supervisor
         .health_snapshot()
         .into_iter()
@@ -268,11 +316,15 @@ fn publish(stack: &ResolvedStack, supervisor: &Supervisor, out: &mut dyn Write) 
             let checked_at = supervisor
                 .checked_at(&name)
                 .map(|millis| clock::format_rfc3339_seconds(millis / 1_000));
+            let record = records.get(&name).cloned().unwrap_or_default();
             (
                 name,
                 CachedHealth {
                     state: health.as_str().to_owned(),
                     checked_at,
+                    restarts: record.restarts,
+                    last_restart_at: record.last_restart_at,
+                    gave_up: record.gave_up,
                 },
             )
         })
