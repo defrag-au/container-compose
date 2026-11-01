@@ -399,9 +399,10 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 - Reading code with `rg`, `grep`, `sed`, `cat`, `head` or `wc` → use `at-peek`. Reading installed
   crate source or build-script output with `grep`, `sed` or `find` under `~/.cargo` or
   `target/…/build` → use `at-crate`. Reading history or working-tree state with `git status`,
-  `git diff` or `git log` → use `at-recall`. All three are read-only, bounded by construction, and
-  say what they did not show. `git show` and `git blame` have no `at-recall` verb yet — say so
-  rather than reaching for them silently.
+  `git diff` or `git log` → use `at-recall`. Asking the chain a question with `curl` → use
+  `at-cardano`. All four are read-only, bounded by construction, and say what they did not show.
+  `git show` and `git blame` have no `at-recall` verb yet — say so rather than reaching for them
+  silently.
 
 | Instead of | Use |
 | --- | --- |
@@ -415,6 +416,7 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 | `git diff`, `git diff --stat` | `at-recall diff [<rev>] [<path>…]` — add `--patch` for the hunks |
 | `git log`, `git log --oneline` | `at-recall log [<rev>] [<path>…]` |
 | the archaeology before a PR description: branch, base, `merge-base`, `log --oneline base..HEAD`, `diff --stat` | `at-recall pr [--base <rev>]` — the branch, its commits and its diffstat in one read |
+| `curl https://api.koios.rest/…`, a retyped JSON body, a key in the command line | `at-cardano <noun> [<aspect>]` · `at-cardano query <endpoint>` · `at-cardano endpoints` · `at-cardano run --scenario <file.dsl>` for several in order |
 | anything not listed | `at-describe` — the catalogue, one screen |
 
 - The exact lines · every mention · how many · which files → `at-peek slice <file>:40-60` ·
@@ -424,6 +426,11 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 - `which at-peek` empty → `direnv exec . at-peek <verb>` (and the same for `at-recall`, `at-crate`
   and `at-describe`). An agent's spawned shell does not inherit the devshell environment; an
   interactive one does.
+- **Never wrap an `at-*` call in `nix develop`.** It works, which is what makes it the expensive
+  mistake: the nix evaluation is paid before the read starts, and the read itself is milliseconds.
+  Measured 2026-10-26: `at-peek stat` bare, 5 ms; `nix develop path:. --command at-peek stat`,
+  7.5 s. If the binary is not on `PATH`, the answers are `direnv exec .` (~140 ms, reads the
+  realised `.direnv/`, needs no daemon) or installing it — never a devshell wrapper.
 - `at-crate` resolves a crate through the nearest `Cargo.lock`, not through memory or "latest". A
   crate named twice in the lock, or a file present in more than one build-script `out`, is an error
   naming the flag that chooses — never a guess. `--version` and `--build-dir` are those flags.
@@ -439,7 +446,10 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
   before editing it.
 - `at-peek` and `at-crate` run nothing at all; `at-recall` runs `git` and nothing else. That
   difference is why they are separate binaries, and why they are separate approvals if I have
-  tiered them.
+  tiered them. `at-cardano` makes HTTPS requests to Koios and nothing else: the host is fixed by
+  `--network`, the key is read from `~/.config/koios/api_key` (never printed), and `/submittx` is
+  refused. Never curl a Koios endpoint to avoid it; the curl is the generic executor this tool
+  replaces.
 - A **recipe** is one verb that composes the reads its sibling verbs use, so a count cannot disagree
   with the listing beside it: `at-recall pr` answers "write me a PR description" with the base, the
   branch's commits and the diffstat by kind, and a caveat naming tracked files that have changed
@@ -451,7 +461,14 @@ nix develop -c cargo clippy --fix --allow-dirty --all-targets --all-features -- 
 - `at-recall` answers `state`, `log`, `diff` and the `pr` recipe. `blame`, `show` and `churn`, and the
   `review` and `release` recipes, are designed and not written — ask for the one you want rather than
   reaching for `git`, and name the question, because that is what turns it into a verb. `at-crate`
-  answers `where`, `installed`, `files`, `slice`, `search` and `out`.
+  answers `where`, `installed`, `files`, `slice`, `search` and `out`. `at-cardano` is noun + aspect —
+  `at-cardano pool delegators <pool>`, `at-cardano tx utxos <hash>`,
+  `at-cardano account rewards <stake>` — and `at-cardano --help` lists the nouns while
+  `at-cardano help <noun>` lists that noun's aspects. Every read endpoint in the published Koios
+  spec has a verb; `at-cardano endpoints` proves it, and `query` is the long tail rather than the
+  way in. A question that takes two answers — the tip's height into `block`, a block's first
+  transaction into `tx` — is `at-cardano run --scenario <file.dsl>`, where a `save` binds one value
+  out of an answer and the next step uses it; `at-cardano run --help` names the five actions.
 
 
 ## Toggle local [patch] blocks as a unit
@@ -493,6 +510,47 @@ nix develop -c cargo tree --target wasm32-unknown-unknown -p <crate>
   native build, so a wasm consumer inherits capabilities it cannot use; a feature that pulls in a
   system library fails at link time, not at the crate that introduced it. Check the transitive
   tree, not the direct dependency.
+
+
+## Never drive a terminal UI with tmux — use tui-shot or the crate's harness
+<!-- rule: rules/org/defrag/tui-capture -->
+
+**Never drive a TUI with tmux.** `tmux` is a generic executor: approving it approves `send-keys`
+into any pane and `attach` to sessions it did not start, so it cannot be granted per-prefix.
+
+| Want | Use |
+| --- | --- |
+| a live screen, keys, a resize, a narrow terminal | `tui-shot` — one PTY, one workspace binary target, no shell |
+| a frame while iterating on the renderer | the crate's own `TestBackend` harness |
+| the second check | `tui-shot`'s `<out>.json` · the harness's `run.json` |
+
+```sh
+tui-shot run --scenario .tmp/factotum.dsl
+tui-shot check --scenario .tmp/factotum.dsl      # parse only, launch nothing
+./target/release/<tui> --state fixtures/x.json --plan examples/x.dsl
+```
+
+- One plan file drives both: `tui-shot` through the PTY, the harness against a captured view. The
+  grammar is `tools/tui-shot/SCENARIO.md` in `agent-playbook`.
+- A harness-only field (`at=`, `status=`) is refused by `tui-shot` by name — omit it in a plan
+  that is meant to run under both.
+- Wait for content, never sleep: `wait … contains=`, `absent=`, `idle=`, `exit=true`.
+- Not: a hand-started tmux session, `send-keys`, `capture-pane`, or a fixed `sleep` between a key
+  and a screen read.
+
+### Why
+
+The factotum agent thread drove `factotum-tui` with `tmux new-session`, `send-keys`, a sleep, then
+`capture-pane` for every state. The loop's speed was the sleeps, and every approval covered an
+executor that can type into any pane on the machine.
+
+Measured on 2026-10-26 against the same TUI: a `tui-shot` run is 650–1100 ms depending on how many
+waits it has; five captures through the crate's `TestBackend` harness are 2 ms in total, at
+180–280 µs a frame. The harness needs no daemon, so a renderer can be reviewed before the service
+it talks to exists.
+
+`tui-shot` refuses a path and a shell command by construction; the harness refuses to write
+outside the repository. That is why either can be approved where tmux cannot.
 
 
 ## Bulk uploads to R2 run on the arm box, not the workstation

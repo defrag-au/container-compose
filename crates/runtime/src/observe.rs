@@ -119,28 +119,35 @@ struct SystemStatus {
     status: String,
 }
 
-/// Read the runtime's world in four calls, gated on `system status`.
+/// Read the runtime's world in five calls; `system status` is advisory.
 pub fn observe(program: &str) -> Result<Observed, RuntimeError> {
-    let status: SystemStatus = parse(
-        "`container system status`",
-        &run(program, &["system", "status", "--format", "json"])?,
-    )?;
-    if status.status != "running" {
-        return Err(RuntimeError::message(format!(
-            "the container runtime is not running (status: `{}`); run `container system start`",
-            status.status
-        )));
-    }
+    // `system status` answers `unregistered` to a launchd session other than
+    // the one that started the runtime (an SSH login, typically) while `list`
+    // works from anywhere — so it must not gate. Ask it only to keep the
+    // actionable message for a genuinely stopped runtime, and let `list` decide.
+    let status = run(program, &["system", "status", "--format", "json"])
+        .ok()
+        .and_then(|output| parse::<SystemStatus>("`container system status`", &output).ok())
+        .map(|status| status.status);
+
+    let containers = match run(program, &["list", "--all", "--format", "json"]) {
+        Ok(output) => parse("`container list`", &output)?,
+        Err(error) => {
+            if let Some(status) = status.filter(|status| status != "running") {
+                return Err(RuntimeError::message(format!(
+                    "the container runtime is not running (status: `{status}`); run `container system start`"
+                )));
+            }
+            return Err(error);
+        }
+    };
 
     Ok(Observed {
         dns_domains: parse(
             "`container system dns list`",
             &run(program, &["system", "dns", "list", "--format", "json"])?,
         )?,
-        containers: parse(
-            "`container list`",
-            &run(program, &["list", "--all", "--format", "json"])?,
-        )?,
+        containers,
         volumes: parse(
             "`container volume list`",
             &run(program, &["volume", "list", "--format", "json"])?,
